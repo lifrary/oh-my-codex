@@ -61,6 +61,14 @@ async function buildLiveWorker(
   workerIndex: number,
   ownerLeadId: string | null,
 ): Promise<EnterpriseLiveWorkerIdentity> {
+  const now = new Date().toISOString();
+  await writeEnterpriseWorkerState(projectRoot, {
+    nodeId: node.id,
+    state: 'starting',
+    paneId,
+    ownerLeadId,
+    updatedAt: now,
+  });
   const instructionPath = await writeEnterpriseWorkerInstructions(projectRoot, {
     nodeId: node.id,
     role: node.role,
@@ -92,7 +100,6 @@ async function buildLiveWorker(
     startupCommand,
     instructionPath,
   };
-  const now = new Date().toISOString();
   await writeEnterpriseWorkerIdentity(projectRoot, { ...record, updatedAt: now });
   await writeEnterpriseWorkerState(projectRoot, {
     nodeId: node.id,
