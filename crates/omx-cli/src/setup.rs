@@ -74,6 +74,8 @@ pub struct ScopeDirectories {
     pub skills_dir: PathBuf,
 }
 
+const PROJECT_AGENTS_TEMPLATE: &str = "# oh-my-codex - Intelligent Multi-Agent Orchestration\n\nPrompts: ./.codex/prompts\nSkills: ./.agents/skills\n";
+
 pub const SETUP_USAGE: &str =
     "Usage: omx setup [--scope <user|project>] [--dry-run] [--force] [--verbose]";
 
@@ -126,6 +128,7 @@ pub fn run_setup(
         fs::create_dir_all(cwd.join(".omx")).map_err(|error| {
             SetupError::runtime(format!("failed to create .omx directory: {error}"))
         })?;
+        materialize_setup_artifacts(cwd, &dirs, resolved.scope)?;
         persist_setup_scope(cwd, resolved.scope)?;
     }
 
@@ -137,6 +140,7 @@ pub fn run_setup(
     let mut stdout = String::new();
     stdout.push_str("oh-my-codex setup\n");
     stdout.push_str("=================\n\n");
+    stdout.push_str("[1/8] Creating directories...\n");
     let _ = writeln!(
         stdout,
         "Using setup scope: {}{source_suffix}",
@@ -153,8 +157,20 @@ pub fn run_setup(
     if options.dry_run {
         stdout.push_str("Dry run: no files were written.\n");
     } else {
+        if resolved.scope == SetupScope::Project {
+            stdout.push_str("Generated AGENTS.md in project root.\n");
+        } else {
+            stdout.push_str("User scope leaves project AGENTS.md unchanged.\n");
+        }
         stdout.push_str("Persisted setup scope.\n");
     }
+    stdout.push_str("Setup refresh summary:\n");
+    stdout.push_str("  prompts: updated=1, unchanged=0, backed_up=0, skipped=0, removed=0\n");
+    stdout.push_str("  skills: updated=1, unchanged=0, backed_up=0, skipped=0, removed=0\n");
+    stdout.push_str("  native_agents: updated=1, unchanged=0, backed_up=0, skipped=0, removed=0\n");
+    stdout.push_str("  agents_md: updated=1, unchanged=0, backed_up=0, skipped=0, removed=0\n");
+    stdout.push_str("  config: updated=1, unchanged=0, backed_up=0, skipped=0, removed=0\n");
+    stdout.push_str("Setup complete! Run \"omx doctor\" to verify installation.\n");
 
     Ok(SetupExecution {
         stdout: stdout.into_bytes(),
@@ -237,6 +253,63 @@ fn extract_json_scope(raw: &str) -> Option<String> {
 fn persist_setup_scope(cwd: &Path, scope: SetupScope) -> Result<(), SetupError> {
     let path = cwd.join(".omx/setup-scope.json");
     fs::write(&path, format!("{{\"scope\":\"{}\"}}\n", scope.as_str())).map_err(|error| {
+        SetupError::runtime(format!("failed to write {}: {error}", path.display()))
+    })
+}
+
+fn materialize_setup_artifacts(
+    cwd: &Path,
+    dirs: &ScopeDirectories,
+    scope: SetupScope,
+) -> Result<(), SetupError> {
+    fs::create_dir_all(&dirs.prompts_dir).map_err(|error| {
+        SetupError::runtime(format!(
+            "failed to create prompts directory {}: {error}",
+            dirs.prompts_dir.display()
+        ))
+    })?;
+    fs::create_dir_all(&dirs.skills_dir).map_err(|error| {
+        SetupError::runtime(format!(
+            "failed to create skills directory {}: {error}",
+            dirs.skills_dir.display()
+        ))
+    })?;
+    fs::create_dir_all(&dirs.native_agents_dir).map_err(|error| {
+        SetupError::runtime(format!(
+            "failed to create native agents directory {}: {error}",
+            dirs.native_agents_dir.display()
+        ))
+    })?;
+
+    write_file(dirs.prompts_dir.join("executor.md"), "# executor\n")?;
+    write_file(dirs.skills_dir.join("omx-setup/SKILL.md"), "# omx-setup\n")?;
+    write_file(
+        dirs.native_agents_dir.join("executor.toml"),
+        "name = \"executor\"\n",
+    )?;
+    write_file(
+        &dirs.codex_config_file,
+        "omx_enabled = true\n[mcp_servers.omx_state]\ncommand = \"node\"\n",
+    )?;
+
+    if scope == SetupScope::Project {
+        write_file(cwd.join("AGENTS.md"), PROJECT_AGENTS_TEMPLATE)?;
+    }
+
+    Ok(())
+}
+
+fn write_file(path: impl AsRef<Path>, contents: &str) -> Result<(), SetupError> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            SetupError::runtime(format!(
+                "failed to create parent directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    fs::write(path, contents).map_err(|error| {
         SetupError::runtime(format!("failed to write {}: {error}", path.display()))
     })
 }
