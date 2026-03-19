@@ -15,7 +15,6 @@ import { hooksCommand } from "./hooks.js";
 import { hudCommand } from "../hud/index.js";
 import { teamCommand } from "./team.js";
 import { ralphCommand } from "./ralph.js";
-import { ralphthonCommand } from "./ralphthon.js";
 import { askCommand } from "./ask.js";
 import { cleanupCommand } from "./cleanup.js";
 import { exploreCommand } from "./explore.js";
@@ -48,10 +47,8 @@ import {
   sessionModelInstructionsPath,
   writeSessionModelInstructionsFile,
 } from "../hooks/agents-overlay.js";
-import { readModeState, updateModeState } from "../modes/base.js";
 import {
   readSessionState,
-  isSessionStale,
   writeSessionStart,
   writeSessionEnd,
   resetSessionMetrics,
@@ -120,7 +117,6 @@ Usage:
                 Alias for agents-init (lightweight AGENTS bootstrap only)
   omx team      Spawn parallel worker panes in tmux and bootstrap inbox/task state
   omx ralph     Launch Codex with ralph persistence mode active
-  omx ralphthon Launch Codex with autonomous hackathon lifecycle mode active
   omx autoresearch Launch thin-supervisor autoresearch with keep/discard/reset parity
   omx version   Show version information
   omx tmux-hook Manage tmux prompt injection workaround (init|status|validate|test)
@@ -177,8 +173,6 @@ const OMX_RALPH_APPEND_INSTRUCTIONS_FILE_ENV =
   "OMX_RALPH_APPEND_INSTRUCTIONS_FILE";
 const OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE_ENV =
   "OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE";
-const OMX_RALPHTHON_APPEND_INSTRUCTIONS_FILE_ENV =
-  "OMX_RALPHTHON_APPEND_INSTRUCTIONS_FILE";
 const REASONING_MODES = ["low", "medium", "high", "xhigh"] as const;
 type ReasoningMode = (typeof REASONING_MODES)[number];
 const REASONING_MODE_SET = new Set<string>(REASONING_MODES);
@@ -215,7 +209,6 @@ type CliCommand =
   | "explore"
   | "sparkshell"
   | "team"
-  | "ralphthon"
   | "session"
   | "resume"
   | "version"
@@ -239,8 +232,6 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "hooks",
   "hud",
   "ralph",
-  "ralphthon",
-  "ralphthon",
   "resume",
   "session",
   "sparkshell",
@@ -371,8 +362,13 @@ export function resolveCodexLaunchPolicy(
   env: NodeJS.ProcessEnv = process.env,
   _platform: NodeJS.Platform = process.platform,
   tmuxAvailable: boolean = isTmuxAvailable(),
+  nativeWindows: boolean = isNativeWindows(),
+  stdinIsTTY: boolean = Boolean(process.stdin.isTTY),
+  stdoutIsTTY: boolean = Boolean(process.stdout.isTTY),
 ): CodexLaunchPolicy {
   if (env.TMUX) return "inside-tmux";
+  if (nativeWindows) return "direct";
+  if (!stdinIsTTY || !stdoutIsTTY) return "direct";
   return tmuxAvailable ? "detached-tmux" : "direct";
 }
 
@@ -569,7 +565,6 @@ export async function main(args: string[]): Promise<void> {
     "sparkshell",
     "team",
     "ralph",
-    "ralphthon",
     "session",
     "resume",
     "version",
@@ -662,9 +657,6 @@ export async function main(args: string[]): Promise<void> {
         break;
       case "ralph":
         await ralphCommand(args.slice(1));
-        break;
-      case "ralphthon":
-        await ralphthonCommand(args.slice(1));
         break;
       case "version":
         version();
@@ -821,6 +813,13 @@ export async function launchWithHud(args: string[]): Promise<void> {
     process.env,
   );
   const codexHomeOverride = resolveCodexHomeForLaunch(launchCwd, process.env);
+  const launchPolicy = resolveCodexLaunchPolicy(
+    process.env,
+    process.platform,
+    undefined,
+    isNativeWindows(),
+  );
+  const enableNotifyFallbackAuthority = launchPolicy === "direct";
   const workerSparkModel = resolveWorkerSparkModel(
     notifyTempResult.passthroughArgs,
     codexHomeOverride,
@@ -874,7 +873,7 @@ export async function launchWithHud(args: string[]): Promise<void> {
 
   // ── Phase 1: preLaunch ──────────────────────────────────────────────────
   try {
-    await preLaunch(cwd, sessionId, notifyTempResult.contract);
+    await preLaunch(cwd, sessionId, notifyTempResult.contract, codexHomeOverride, enableNotifyFallbackAuthority);
   } catch (err) {
     // preLaunch errors must NOT prevent Codex from starting
     console.error(
@@ -897,7 +896,7 @@ export async function launchWithHud(args: string[]): Promise<void> {
     );
   } finally {
     // ── Phase 3: postLaunch ─────────────────────────────────────────────
-    await postLaunch(cwd, sessionId);
+    await postLaunch(cwd, sessionId, codexHomeOverride, enableNotifyFallbackAuthority);
   }
 }
 
@@ -953,7 +952,7 @@ export async function execWithOverlay(args: string[]): Promise<void> {
   }
 
   try {
-    await preLaunch(cwd, sessionId, notifyTempResult.contract);
+    await preLaunch(cwd, sessionId, notifyTempResult.contract, codexHomeOverride, true);
   } catch (err) {
     console.error(
       `[omx] preLaunch warning: ${err instanceof Error ? err.message : err}`,
@@ -981,7 +980,7 @@ export async function execWithOverlay(args: string[]): Promise<void> {
       : codexEnvBase;
     runCodexBlocking(cwd, codexArgs, codexEnv);
   } finally {
-    await postLaunch(cwd, sessionId);
+    await postLaunch(cwd, sessionId, codexHomeOverride, true);
   }
 }
 
@@ -1345,6 +1344,24 @@ function detectDetachedSessionWindowIndex(sessionName: string): string | null {
   }
 }
 
+function escapeShellDoubleQuotedValue(value: string): string {
+  return value.replace(/["\\$`]/g, "\\$&");
+}
+
+function buildDetachedSessionLeaderCommand(
+  sessionName: string,
+  codexCmd: string,
+): string {
+  const cleanupTrap = [
+    "status=$?;",
+    "trap - 0 INT TERM HUP;",
+    `tmux kill-session -t "${escapeShellDoubleQuotedValue(sessionName)}" >/dev/null 2>&1 || true;`,
+    "exit $status;",
+  ].join(" ");
+  const wrapped = [`trap '${cleanupTrap}' 0 INT TERM HUP;`, codexCmd].join(" ");
+  return `/bin/sh -lc ${quoteShellArg(wrapped)}`;
+}
+
 export function buildDetachedSessionBootstrapSteps(
   sessionName: string,
   cwd: string,
@@ -1355,6 +1372,9 @@ export function buildDetachedSessionBootstrapSteps(
   notifyTempContractRaw?: string | null,
   nativeWindows = false,
 ): DetachedSessionTmuxStep[] {
+  const detachedLeaderCmd = nativeWindows
+    ? "powershell.exe"
+    : buildDetachedSessionLeaderCommand(sessionName, codexCmd);
   const newSessionArgs: string[] = [
     "new-session",
     "-d",
@@ -1372,7 +1392,7 @@ export function buildDetachedSessionBootstrapSteps(
     ...(notifyTempContractRaw
       ? ["-e", `${OMX_NOTIFY_TEMP_CONTRACT_ENV}=${notifyTempContractRaw}`]
       : []),
-    nativeWindows ? "powershell.exe" : codexCmd,
+    detachedLeaderCmd,
   ];
   const splitCaptureArgs: string[] = [
     "split-window",
@@ -1395,44 +1415,9 @@ export function buildDetachedSessionBootstrapSteps(
   ];
 }
 
-async function updateActiveRalphthonLaunchTarget(
-  cwd: string,
-  patch: {
-    leader_pane_id?: string | null;
-    tmux_pane_id?: string | null;
-    tmux_session?: string | null;
-  },
-): Promise<void> {
-  const state = await readModeState("ralphthon", cwd).catch(() => null);
-  if (!state || state.active !== true) return;
-
-  const next: Record<string, unknown> = {};
-  if (
-    typeof patch.leader_pane_id === "string" &&
-    patch.leader_pane_id.trim().startsWith("%")
-  ) {
-    next.leader_pane_id = patch.leader_pane_id.trim();
-    next.tmux_pane_id = patch.leader_pane_id.trim();
-  } else if (
-    typeof patch.tmux_pane_id === "string" &&
-    patch.tmux_pane_id.trim().startsWith("%")
-  ) {
-    next.tmux_pane_id = patch.tmux_pane_id.trim();
-  }
-  if (
-    typeof patch.tmux_session === "string" &&
-    patch.tmux_session.trim() !== ""
-  ) {
-    next.tmux_session = patch.tmux_session.trim();
-  }
-  if (Object.keys(next).length === 0) return;
-  await updateModeState("ralphthon", next, cwd).catch(() => {});
-}
-
 async function readLaunchAppendInstructions(): Promise<string> {
   const appendixCandidates = [
     process.env[OMX_RALPH_APPEND_INSTRUCTIONS_FILE_ENV]?.trim(),
-    process.env[OMX_RALPHTHON_APPEND_INSTRUCTIONS_FILE_ENV]?.trim(),
     process.env[OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE_ENV]?.trim(),
   ].filter(
     (value): value is string => typeof value === "string" && value.length > 0,
@@ -1562,34 +1547,37 @@ export function buildNotifyTempStartupMessages(
   return { infoLines, warningLines };
 }
 
+export function buildNotifyFallbackWatcherEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  options: {
+    codexHomeOverride?: string;
+    enableAuthority?: boolean;
+  } = {},
+): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    ...(options.codexHomeOverride ? { CODEX_HOME: options.codexHomeOverride } : {}),
+    OMX_HUD_AUTHORITY: options.enableAuthority ? "1" : "0",
+  };
+}
+
 /**
  * preLaunch: Prepare environment before Codex starts.
- * 1. Orphan cleanup (stale session from a crashed launch)
- * 2. Generate runtime overlay + write session-scoped model instructions file
- * 3. Write session.json
+ * 1. Generate runtime overlay + write session-scoped model instructions file
+ * 2. Write session.json
+ *
+ * Automatic stale-session cleanup is intentionally disabled here. Destructive
+ * cleanup must be explicit via `omx cleanup` so normal launches never reap
+ * files or processes from other OMX sessions.
  */
 async function preLaunch(
   cwd: string,
   sessionId: string,
   notifyTempContract?: NotifyTempContract,
+  codexHomeOverride?: string,
+  enableNotifyFallbackAuthority: boolean = false,
 ): Promise<void> {
-  // 1. Orphan cleanup
-  const existingSession = await readSessionState(cwd);
-  if (existingSession && isSessionStale(existingSession)) {
-    try {
-      await removeSessionModelInstructionsFile(cwd, existingSession.session_id);
-    } catch (err) {
-      process.stderr.write(`[cli/index] operation failed: ${err}\n`);
-    }
-    const { unlink } = await import("fs/promises");
-    try {
-      await unlink(join(cwd, ".omx", "state", "session.json"));
-    } catch (err) {
-      process.stderr.write(`[cli/index] operation failed: ${err}\n`);
-    }
-  }
-
-  // 2. Generate runtime overlay + write session-scoped model instructions file
+  // 1. Generate runtime overlay + write session-scoped model instructions file
   const orchestrationMode = await resolveSessionOrchestrationMode(
     cwd,
     sessionId,
@@ -1604,19 +1592,19 @@ ${launchAppendix}`
       : overlay;
   await writeSessionModelInstructionsFile(cwd, sessionId, sessionInstructions);
 
-  // 3. Write session state
+  // 2. Write session state
   await resetSessionMetrics(cwd);
   await writeSessionStart(cwd, sessionId);
 
-  // 4. Start notify fallback watcher (best effort)
+  // 3. Start notify fallback watcher (best effort)
   try {
-    await startNotifyFallbackWatcher(cwd);
+    await startNotifyFallbackWatcher(cwd, { codexHomeOverride, enableAuthority: enableNotifyFallbackAuthority });
   } catch (err) {
     process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal
   }
 
-  // 5. Start derived watcher (best effort, opt-in)
+  // 4. Start derived watcher (best effort, opt-in)
   try {
     await startHookDerivedWatcher(cwd);
   } catch (err) {
@@ -1624,7 +1612,7 @@ ${launchAppendix}`
     // Non-fatal
   }
 
-  // 6. Emit temp notification startup summary + warnings, then send session-start lifecycle notification (best effort)
+  // 5. Emit temp notification startup summary + warnings, then send session-start lifecycle notification (best effort)
   try {
     if (notifyTempContract?.active) {
       process.env[OMX_NOTIFY_TEMP_CONTRACT_ENV] =
@@ -1656,7 +1644,7 @@ ${launchAppendix}`
     // Non-fatal: notification failures must never block launch
   }
 
-  // 7. Dispatch native hook event (best effort)
+  // 6. Dispatch native hook event (best effort)
   try {
     await emitNativeHookEvent(cwd, "session-start", {
       session_id: sessionId,
@@ -1712,7 +1700,12 @@ function runCodex(
     ? { ...codexEnv, [OMX_NOTIFY_TEMP_CONTRACT_ENV]: notifyTempContractRaw }
     : codexEnv;
 
-  const launchPolicy = resolveCodexLaunchPolicy(process.env);
+  const launchPolicy = resolveCodexLaunchPolicy(
+    process.env,
+    process.platform,
+    undefined,
+    nativeWindows,
+  );
 
   if (isCodexVersionRequest(launchArgs)) {
     runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
@@ -1756,18 +1749,11 @@ function runCodex(
 
     const activePaneId = process.env.TMUX_PANE?.trim();
     if (activePaneId) {
-      let tmuxSessionName: string | undefined;
       try {
-        const displayArgs = ["display-message", "-p", "-t", activePaneId, "#S"];
-        tmuxSessionName =
-          execFileSync("tmux", displayArgs, { encoding: "utf-8" }).trim() ||
-          undefined;
+        execFileSync("tmux", ["display-message", "-p", "-t", activePaneId, "#S"], {
+          encoding: "utf-8",
+        });
       } catch {}
-      void updateActiveRalphthonLaunchTarget(cwd, {
-        leader_pane_id: activePaneId,
-        tmux_pane_id: activePaneId,
-        tmux_session: tmuxSessionName ?? null,
-      });
     }
 
     try {
@@ -1795,7 +1781,6 @@ function runCodex(
     const tmuxSessionId = `omx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const sessionName = buildTmuxSessionName(cwd, tmuxSessionId);
     let createdDetachedSession = false;
-    let detachedLeaderPaneId: string | null = null;
     let registeredHookTarget: string | null = null;
     let registeredHookName: string | null = null;
     let registeredClientAttachedHookName: string | null = null;
@@ -1817,12 +1802,7 @@ function runCodex(
         });
         if (step.name === "new-session") {
           createdDetachedSession = true;
-          detachedLeaderPaneId = parsePaneIdFromTmuxOutput(output || "");
-          void updateActiveRalphthonLaunchTarget(cwd, {
-            leader_pane_id: detachedLeaderPaneId,
-            tmux_pane_id: detachedLeaderPaneId,
-            tmux_session: sessionName,
-          });
+          parsePaneIdFromTmuxOutput(output || "");
         }
         if (step.name === "split-and-capture-hud-pane") {
           const hudPaneId = parsePaneIdFromTmuxOutput(output || "");
@@ -2066,7 +2046,12 @@ function scheduleDetachedWindowsCodexLaunch(
  * postLaunch: Clean up after Codex exits.
  * Each step is independently fault-tolerant (try/catch per step).
  */
-async function postLaunch(cwd: string, sessionId: string): Promise<void> {
+async function postLaunch(
+  cwd: string,
+  sessionId: string,
+  codexHomeOverride?: string,
+  enableNotifyFallbackAuthority: boolean = false,
+): Promise<void> {
   // Capture session start time before cleanup (writeSessionEnd deletes session.json)
   let sessionStartedAt: string | undefined;
   try {
@@ -2079,7 +2064,7 @@ async function postLaunch(cwd: string, sessionId: string): Promise<void> {
 
   // 0. Flush fallback watcher once to reduce race with fast codex exit.
   try {
-    await flushNotifyFallbackOnce(cwd);
+    await flushNotifyFallbackOnce(cwd, { codexHomeOverride, enableAuthority: enableNotifyFallbackAuthority });
   } catch (err) {
     process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal
@@ -2221,6 +2206,7 @@ async function emitNativeHookEvent(
   });
   await dispatchHookEvent(payload, {
     cwd,
+    enabled: true,
   });
 }
 
@@ -2259,14 +2245,17 @@ function tryKillPid(pid: number, signal: NodeJS.Signals = "SIGTERM"): boolean {
   }
 }
 
-async function startNotifyFallbackWatcher(cwd: string): Promise<void> {
+async function startNotifyFallbackWatcher(
+  cwd: string,
+  options: { codexHomeOverride?: string; enableAuthority?: boolean } = {},
+): Promise<void> {
   if (process.env.OMX_NOTIFY_FALLBACK === "0") return;
 
   const { mkdir, writeFile, readFile } = await import("fs/promises");
   const pidPath = notifyFallbackPidPath(cwd);
   const pkgRoot = getPackageRoot();
   const watcherScript = join(pkgRoot, "scripts", "notify-fallback-watcher.js");
-  const notifyScript = join(pkgRoot, "scripts", "notify-hook.js");
+  const notifyScript = join(pkgRoot, "dist", "scripts", "notify-hook.js");
   if (!existsSync(watcherScript) || !existsSync(notifyScript)) return;
 
   // Stop stale watcher from a previous run.
@@ -2320,6 +2309,10 @@ async function startNotifyFallbackWatcher(cwd: string): Promise<void> {
       cwd,
       detached: true,
       stdio: "ignore",
+      env: buildNotifyFallbackWatcherEnv(process.env, {
+        codexHomeOverride: options.codexHomeOverride,
+        enableAuthority: options.enableAuthority === true,
+      }),
     },
   );
   child.unref();
@@ -2467,11 +2460,14 @@ async function stopHookDerivedWatcher(cwd: string): Promise<void> {
   });
 }
 
-async function flushNotifyFallbackOnce(cwd: string): Promise<void> {
+async function flushNotifyFallbackOnce(
+  cwd: string,
+  options: { codexHomeOverride?: string; enableAuthority?: boolean } = {},
+): Promise<void> {
   const { spawnSync } = await import("child_process");
   const pkgRoot = getPackageRoot();
   const watcherScript = join(pkgRoot, "scripts", "notify-fallback-watcher.js");
-  const notifyScript = join(pkgRoot, "scripts", "notify-hook.js");
+  const notifyScript = join(pkgRoot, "dist", "scripts", "notify-hook.js");
   if (!existsSync(watcherScript) || !existsSync(notifyScript)) return;
   spawnSync(
     process.execPath,
@@ -2480,6 +2476,10 @@ async function flushNotifyFallbackOnce(cwd: string): Promise<void> {
       cwd,
       stdio: "ignore",
       timeout: 3000,
+      env: buildNotifyFallbackWatcherEnv(process.env, {
+        codexHomeOverride: options.codexHomeOverride,
+        enableAuthority: options.enableAuthority === true,
+      }),
     },
   );
 }

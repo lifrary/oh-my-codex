@@ -17,7 +17,6 @@ import {
   dismissTrustPromptIfPresent,
   sleepFractionalSeconds,
   sendToWorker,
-  sendToLeaderPane,
   sendToWorkerStdin,
   isWorkerAlive,
   getWorkerPanePid,
@@ -85,6 +84,8 @@ import {
   generateWorkerOverlay,
   writeTeamWorkerInstructionsFile,
   removeTeamWorkerInstructionsFile,
+  writeWorkerWorktreeRootAgentsFile,
+  removeWorkerWorktreeRootAgentsFile,
   generateInitialInbox,
   generateTaskAssignmentInbox,
   generateShutdownInbox,
@@ -97,16 +98,16 @@ import { loadRolePrompt } from './role-router.js';
 import { codexPromptsDir } from '../utils/paths.js';
 import { type TeamPhase, type TerminalPhase } from './orchestrator.js';
 import {
-  isLowComplexityAgentType,
   resolveTeamWorkerLaunchArgs,
   TEAM_LOW_COMPLEXITY_DEFAULT_MODEL,
-  resolveTeamLowComplexityDefaultModel,
   parseTeamWorkerLaunchArgs,
   splitWorkerLaunchArgs,
+  resolveAgentDefaultModel,
   resolveAgentReasoningEffort,
   type TeamReasoningEffort,
 } from './model-contract.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
+import { isBridgeEnabled, getDefaultBridge } from '../runtime/bridge.js';
 import { inferPhaseTargetFromTaskCounts, reconcilePhaseStateForMonitor } from './phase-controller.js';
 import { getTeamTmuxSessions } from '../notifications/tmux.js';
 import { hasStructuredVerificationEvidence } from '../verification/verifier.js';
@@ -1233,9 +1234,7 @@ export function resolveWorkerLaunchArgsFromEnv(
   const inheritedArgs = (typeof inheritedLeaderModel === 'string' && inheritedLeaderModel.trim() !== '')
     ? ['--model', inheritedLeaderModel.trim()]
     : [];
-  const fallbackModel = isLowComplexityAgentType(agentType)
-    ? resolveTeamLowComplexityDefaultModel(env.CODEX_HOME)
-    : undefined;
+  const fallbackModel = resolveAgentDefaultModel(agentType, env.CODEX_HOME);
 
   // Detect if an explicit reasoning override exists before resolving (for log source labelling)
   const preEnvArgs = splitWorkerLaunchArgs(env.OMX_TEAM_WORKER_LAUNCH_ARGS);
@@ -1389,9 +1388,7 @@ export async function startTeam(
   let config: TeamConfig | null = null;
   const sharedWorkerLaunchArgs = resolveTeamWorkerLaunchArgs({
     existingRaw: process.env.OMX_TEAM_WORKER_LAUNCH_ARGS,
-    fallbackModel: isLowComplexityAgentType(agentType)
-      ? resolveTeamLowComplexityDefaultModel(process.env.CODEX_HOME)
-      : undefined,
+    fallbackModel: resolveAgentDefaultModel(agentType, process.env.CODEX_HOME),
   });
   const workerCliPlan = resolveTeamWorkerCliPlan(workerCount, sharedWorkerLaunchArgs, process.env);
   const workerReadyTimeoutMs = resolveWorkerReadyTimeoutMs(process.env);
@@ -1411,6 +1408,7 @@ export async function startTeam(
         leader_cwd: leaderCwd,
         team_state_root: teamStateRoot,
         workspace_mode: workspaceMode,
+        worktree_mode: effectiveWorktreeMode,
       },
       options.ralph === true ? 'linked_ralph' : 'default',
     );
@@ -1420,6 +1418,7 @@ export async function startTeam(
     config.leader_cwd = leaderCwd;
     config.team_state_root = teamStateRoot;
     config.workspace_mode = workspaceMode;
+    config.worktree_mode = effectiveWorktreeMode;
 
     // 4. Create tasks
     for (const t of tasks) {
@@ -1433,9 +1432,11 @@ export async function startTeam(
       }, leaderCwd);
     }
 
-    // 5. Write team-scoped worker instructions file (no mutation of project AGENTS.md)
-    workerInstructionsPath = await writeTeamWorkerInstructionsFile(sanitized, leaderCwd, overlay);
-    setTeamModelInstructionsFile(sanitized, workerInstructionsPath);
+    // 5. Write team-scoped worker instructions file only for single-workspace mode.
+    if (workspaceMode !== 'worktree') {
+      workerInstructionsPath = await writeTeamWorkerInstructionsFile(sanitized, leaderCwd, overlay);
+      setTeamModelInstructionsFile(sanitized, workerInstructionsPath);
+    }
 
     const allTasks = await listTasks(sanitized, leaderCwd);
     const workerBootstrapPlans = [] as Array<{
@@ -1470,14 +1471,27 @@ export async function startTeam(
         : agentType;
       const rolePromptContent = await loadRolePrompt(workerRole, join(leaderCwd, '.codex', 'prompts'))
         ?? await loadRolePrompt(workerRole, codexPromptsDir());
-      const instructionsFilePath = rolePromptContent
-        ? await writeWorkerRoleInstructionsFile(sanitized, workerName, leaderCwd, workerInstructionsPath, workerRole, rolePromptContent)
-        : workerInstructionsPath;
+      const workerWorktreePath = workerWorkspace.worktreePath ?? undefined;
+      const fallbackInstructionsPath = workerInstructionsPath ?? join(leaderCwd, 'AGENTS.md');
+      const instructionsFilePath = workerWorktreePath
+        ? await writeWorkerWorktreeRootAgentsFile({
+          teamName: sanitized,
+          workerName,
+          workerRole,
+          rolePromptContent: rolePromptContent ?? "",
+          teamStateRoot,
+          leaderCwd,
+          worktreePath: workerWorktreePath,
+        })
+        : rolePromptContent
+          ? await writeWorkerRoleInstructionsFile(sanitized, workerName, leaderCwd, fallbackInstructionsPath, workerRole, rolePromptContent)
+          : fallbackInstructionsPath;
       const inbox = generateInitialInbox(workerName, sanitized, agentType, workerTasks, {
         teamStateRoot,
         leaderCwd,
         workerRole,
         rolePromptContent: rolePromptContent ?? undefined,
+        worktreeRootAgentsCanonical: Boolean(workerWorkspace.worktreePath),
       });
       const trigger = generateTriggerMessage(
         workerName,
@@ -1487,7 +1501,7 @@ export async function startTeam(
       const preferredReasoning = resolveAgentReasoningEffort(workerRole) ?? resolveAgentReasoningEffort(agentType);
       const workerLaunchArgs = resolveWorkerLaunchArgsFromEnv(
         process.env,
-        agentType,
+        workerRole,
         undefined,
         preferredReasoning,
         workerCliPlan[i - 1],
@@ -1768,6 +1782,21 @@ export async function startTeam(
       }
     }
 
+    if (config) {
+      for (const worker of config.workers) {
+        if (!worker.worktree_path || !worker.team_state_root) continue;
+        try {
+          await removeWorkerWorktreeRootAgentsFile(
+            sanitized,
+            worker.name,
+            worker.team_state_root,
+            worker.worktree_path,
+          );
+        } catch (cleanupError) {
+          rollbackErrors.push(`removeWorkerWorktreeRootAgentsFile(${worker.name}): ${String(cleanupError)}`);
+        }
+      }
+    }
     if (workerInstructionsPath) {
       try {
         await removeTeamWorkerInstructionsFile(sanitized, leaderCwd);
@@ -2399,7 +2428,20 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
 
   await prepareWorkerWorktreeShutdownReports(config, cwd);
 
-  // 5. Remove team-scoped worker instructions file (no mutation of project AGENTS.md)
+  // 5. Remove worker worktree-root instructions and team-scoped fallback instructions.
+  for (const worker of config.workers) {
+    if (!worker.worktree_path || !worker.team_state_root) continue;
+    try {
+      await removeWorkerWorktreeRootAgentsFile(
+        sanitized,
+        worker.name,
+        worker.team_state_root,
+        worker.worktree_path,
+      );
+    } catch (err) {
+      process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
+    }
+  }
   try {
     await removeTeamWorkerInstructionsFile(sanitized, cwd);
   } catch (err) {
@@ -2741,6 +2783,22 @@ async function dispatchCriticalInboxInstruction(params: {
     requireWorkerStartupEvidence,
   } = params;
 
+  // --- Rust runtime bridge: dual-write dispatch mutations ---
+  if (isBridgeEnabled()) {
+    try {
+      const bridge = getDefaultBridge(cwd);
+      const bridgeRequestId = `dispatch-${workerName}-${Date.now()}`;
+      bridge.execCommand({
+        command: 'QueueDispatch',
+        request_id: bridgeRequestId,
+        target: workerName,
+        metadata: { kind: 'inbox', inbox_correlation_key: inboxCorrelationKey },
+      });
+    } catch (_bridgeErr) {
+      // Bridge failure is non-fatal — fall through to existing JS logic
+    }
+  }
+
   if (config.worker_launch_mode === 'prompt') {
     return await queueInboxInstruction({
       teamName,
@@ -2821,6 +2879,9 @@ async function dispatchCriticalInboxInstruction(params: {
   if (receipt?.status === 'failed') {
     const fallback = await notifyWorkerOutcome(config, workerIndex, triggerMessage, paneId);
     if (fallback.ok) {
+      if (isBridgeEnabled()) {
+        try { getDefaultBridge(cwd).execCommand({ command: 'MarkFailed', request_id: queued.request_id, reason: `fallback_confirmed_after_failed_receipt:${fallback.reason}` }); } catch (_) { /* non-fatal */ }
+      }
       await transitionDispatchRequest(
         teamName,
         queued.request_id,
@@ -2835,6 +2896,9 @@ async function dispatchCriticalInboxInstruction(params: {
         reason: `fallback_confirmed_after_failed_receipt:${fallback.reason}`,
         request_id: queued.request_id,
       };
+    }
+    if (isBridgeEnabled()) {
+      try { getDefaultBridge(cwd).execCommand({ command: 'MarkFailed', request_id: queued.request_id, reason: `fallback_attempted_but_unconfirmed:${fallback.reason}` }); } catch (_) { /* non-fatal */ }
     }
     await transitionDispatchRequest(
       teamName,
@@ -2860,6 +2924,9 @@ async function dispatchCriticalInboxInstruction(params: {
     ? `${startupFallbackLabel}_fallback_failed:${fallback.reason}`
     : `fallback_attempted_but_unconfirmed:${fallback.reason}`;
   if (fallback.ok) {
+    if (isBridgeEnabled()) {
+      try { getDefaultBridge(cwd).execCommand({ command: 'MarkNotified', request_id: queued.request_id, channel: `fallback_confirmed:${fallback.reason}` }); } catch (_) { /* non-fatal */ }
+    }
     const marked = await markDispatchRequestNotified(
       teamName,
       queued.request_id,
@@ -2867,6 +2934,9 @@ async function dispatchCriticalInboxInstruction(params: {
       cwd,
     );
     if (!marked) {
+      if (isBridgeEnabled()) {
+        try { getDefaultBridge(cwd).execCommand({ command: 'MarkFailed', request_id: queued.request_id, reason: `fallback_confirmed_after_failed_receipt:${fallback.reason}` }); } catch (_) { /* non-fatal */ }
+      }
       await transitionDispatchRequest(
         teamName,
         queued.request_id,
@@ -2888,6 +2958,9 @@ async function dispatchCriticalInboxInstruction(params: {
 
   const current = await readDispatchRequest(teamName, queued.request_id, cwd);
   if (current && current.status !== 'failed') {
+    if (isBridgeEnabled()) {
+      try { getDefaultBridge(cwd).execCommand({ command: 'MarkFailed', request_id: queued.request_id, reason: fallbackFailureReason }); } catch (_) { /* non-fatal */ }
+    }
     await transitionDispatchRequest(
       teamName,
       queued.request_id,
@@ -3045,19 +3118,9 @@ async function finalizeHookPreferredMailboxDispatch(params: {
 }
 
 async function notifyLeaderAsync(config: TeamConfig, message: string, cwd: string): Promise<DispatchOutcome> {
-  // Primary: inject directly into the leader pane via tmux send-keys.
-  // This is the fallback path when hook-based dispatch timed out, so the
-  // leader needs a direct tmux notification to wake up. Fixes #437.
-  if (config.leader_pane_id && isTmuxAvailable()) {
-    try {
-      await sendToLeaderPane(config.leader_pane_id, message);
-      return { ok: true, transport: 'tmux_send_keys', reason: 'leader_pane_notified' };
-    } catch (err) {
-      process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
-      // Fall through to mailbox
-    }
-  }
-  // Fallback: write to leader mailbox (leader picks up on next hook cycle)
+  // Canonical leader delivery is durable mailbox persistence plus HUD-owned
+  // authority processing. Team runtime must not directly inject into the
+  // leader pane from this fallback path.
   const { notifyLeaderMailboxAsync } = await import('./tmux-session.js');
   const persisted = await notifyLeaderMailboxAsync(config.name, 'system', message, cwd);
   if (!persisted) {
@@ -3114,6 +3177,20 @@ async function deliverPendingMailboxMessages(
         1,
         resolveInstructionStateRoot(workerInfo.worktree_path),
       );
+      // --- Rust runtime bridge: dual-write mailbox dispatch ---
+      if (isBridgeEnabled()) {
+        try {
+          const bridge = getDefaultBridge(cwd);
+          bridge.execCommand({
+            command: 'QueueDispatch',
+            request_id: `mailbox-${msg.message_id}-${Date.now()}`,
+            target: worker.name,
+            metadata: { kind: 'mailbox', message_id: msg.message_id },
+          });
+        } catch (_bridgeErr) {
+          // Bridge failure is non-fatal — fall through to existing JS logic
+        }
+      }
       const transportPreference = config.worker_launch_mode === 'prompt'
         ? 'prompt_stdin'
         : (dispatchPolicy.dispatch_mode === 'transport_direct' ? 'transport_direct' : 'hook_preferred_with_fallback');
@@ -3151,6 +3228,10 @@ async function deliverPendingMailboxMessages(
         const direct = await notifyWorkerOutcome(config, workerInfo.index, triggerMessage, workerInfo.pane_id);
         outcome = { ...direct, request_id: queued.request.request_id, message_id: msg.message_id };
         if (outcome.ok) {
+          if (isBridgeEnabled()) {
+            try { getDefaultBridge(cwd).execCommand({ command: 'MarkNotified', request_id: queued.request.request_id, channel: `direct:${outcome.reason}` }); } catch (_) { /* non-fatal */ }
+            try { getDefaultBridge(cwd).execCommand({ command: 'MarkMailboxNotified', message_id: msg.message_id }); } catch (_) { /* non-fatal */ }
+          }
           await markMessageNotified(teamName, worker.name, msg.message_id, cwd).catch(() => false);
           await markDispatchRequestNotified(
             teamName,
@@ -3186,6 +3267,24 @@ export async function sendWorkerMessage(
   if (!config) throw new Error(`Team ${sanitized} not found`);
   const manifest = await readTeamManifestV2(sanitized, cwd);
   const dispatchPolicy = resolveDispatchPolicy(manifest?.policy, config.worker_launch_mode);
+
+  // --- Rust runtime bridge: dual-write mailbox message creation ---
+  if (isBridgeEnabled()) {
+    try {
+      const bridge = getDefaultBridge(cwd);
+      const bridgeMessageId = `msg-${fromWorker}-${toWorker}-${Date.now()}`;
+      bridge.execCommand({
+        command: 'CreateMailboxMessage',
+        message_id: bridgeMessageId,
+        from_worker: fromWorker,
+        to_worker: toWorker,
+        body,
+      });
+    } catch (_bridgeErr) {
+      // Bridge failure is non-fatal — fall through to existing JS logic
+    }
+  }
+
   if (toWorker === 'leader-fixed') {
     const leaderTriggerMessage = generateLeaderMailboxTriggerMessage(sanitized, fromWorker);
     const leaderTransportPreference = dispatchPolicy.dispatch_mode === 'transport_direct'
@@ -3310,6 +3409,25 @@ export async function broadcastWorkerMessage(
   const transportPreference = config.worker_launch_mode === 'prompt'
     ? 'prompt_stdin'
     : (dispatchPolicy.dispatch_mode === 'transport_direct' ? 'transport_direct' : 'hook_preferred_with_fallback');
+
+  // --- Rust runtime bridge: dual-write broadcast mailbox messages ---
+  if (isBridgeEnabled()) {
+    try {
+      const bridge = getDefaultBridge(cwd);
+      for (const w of config.workers) {
+        const bridgeMessageId = `bcast-${fromWorker}-${w.name}-${Date.now()}`;
+        bridge.execCommand({
+          command: 'CreateMailboxMessage',
+          message_id: bridgeMessageId,
+          from_worker: fromWorker,
+          to_worker: w.name,
+          body,
+        });
+      }
+    } catch (_bridgeErr) {
+      // Bridge failure is non-fatal — fall through to existing JS logic
+    }
+  }
 
   const outcomes = await queueBroadcastMailboxMessage({
     teamName: sanitized,

@@ -27,6 +27,14 @@ function flush(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+async function waitFor(predicate: () => boolean, attempts = 20): Promise<void> {
+  for (let index = 0; index < attempts; index += 1) {
+    if (predicate()) return;
+    await flush();
+  }
+  assert.ok(predicate(), 'condition should become true before timeout');
+}
+
 afterEach(() => {
   process.exitCode = undefined;
 });
@@ -111,14 +119,41 @@ describe('runWatchMode', () => {
     timerTick?.();
 
     releaseFirstRender?.();
-    await flush();
-    await flush();
+    await waitFor(() => callCount === 2);
 
     sigintHandler?.();
     await promise;
 
     assert.equal(maxInFlight, 1);
     assert.equal(callCount, 2, 'multiple overlapping ticks should collapse to one queued rerender');
+  });
+
+
+  it('runs authority tick after each rendered frame', async () => {
+    const writes: string[] = [];
+    let sigintHandler: (() => void) | undefined;
+    let authorityCalls = 0;
+
+    const promise = runWatchMode('/tmp', WATCH_FLAGS, {
+      isTTY: true,
+      env: {},
+      readAllStateFn: async () => emptyCtx(),
+      readHudConfigFn: async () => ({ preset: 'focused', git: { display: 'repo-branch' } }),
+      renderHudFn: () => 'frame',
+      writeStdout: (text) => { writes.push(text); },
+      writeStderr: () => {},
+      registerSigint: (handler) => { sigintHandler = handler; },
+      setIntervalFn: () => ({}) as ReturnType<typeof setInterval>,
+      clearIntervalFn: () => {},
+      runAuthorityTickFn: async ({ cwd }) => { authorityCalls += 1; assert.equal(cwd, '/tmp'); },
+    });
+
+    await flush();
+    sigintHandler?.();
+    await promise;
+
+    assert.equal(authorityCalls, 1);
+    assert.ok(writes.some((chunk) => chunk.includes('frame')));
   });
 
   it('handles render failures gracefully and restores terminal state', async () => {

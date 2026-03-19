@@ -1,4 +1,4 @@
-import { afterEach, describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
 import { join } from 'path';
@@ -45,8 +45,16 @@ import {
   resolveDispatchLockTimeoutMs,
 } from '../state.js';
 
+const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
+
+beforeEach(() => {
+  delete process.env.OMX_TEAM_STATE_ROOT;
+});
+
 afterEach(() => {
   resetWriteAtomicRenameForTests();
+  if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
+  else delete process.env.OMX_TEAM_STATE_ROOT;
 });
 
 describe('team state', () => {
@@ -291,17 +299,20 @@ describe('team state', () => {
           leader_cwd: '/tmp/leader',
           team_state_root: '/tmp/leader/.omx/state',
           workspace_mode: 'worktree',
+          worktree_mode: { enabled: true, detached: false, name: 'feature/team-meta' },
         },
       );
       assert.equal(cfg.leader_cwd, '/tmp/leader');
       assert.equal(cfg.team_state_root, '/tmp/leader/.omx/state');
       assert.equal(cfg.workspace_mode, 'worktree');
+      assert.deepEqual(cfg.worktree_mode, { enabled: true, detached: false, name: 'feature/team-meta' });
 
       const manifest = await readTeamManifestV2('team-meta', cwd);
       assert.ok(manifest);
       assert.equal(manifest?.leader_cwd, '/tmp/leader');
       assert.equal(manifest?.team_state_root, '/tmp/leader/.omx/state');
       assert.equal(manifest?.workspace_mode, 'worktree');
+      assert.deepEqual(manifest?.worktree_mode, { enabled: true, detached: false, name: 'feature/team-meta' });
       assert.equal(manifest?.lifecycle_profile, 'default');
       assert.equal(manifest?.leader_pane_id, null);
       assert.equal(manifest?.hud_pane_id, null);

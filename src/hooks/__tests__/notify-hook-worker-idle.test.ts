@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const NOTIFY_HOOK_SCRIPT = new URL('../../../scripts/notify-hook.js', import.meta.url);
+const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', import.meta.url);
 
 async function withTempWorkingDir(run: (cwd: string) => Promise<void>): Promise<void> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-notify-worker-idle-'));
@@ -805,7 +805,7 @@ exit 0
       assert.match(tmuxLog, /worker-1 idle/, 'per-worker idle should fire');
       assert.match(tmuxLog, /Next: read worker-1's latest message\/output, then assign the next concrete step or mark the task complete/, 'per-worker idle nudge should include a next action');
       assert.match(tmuxLog, /All 1 worker idle/, 'all-workers-idle should also fire');
-      assert.match(tmuxLog, /Next: run omx team status both-hooks, check unread worker messages, then assign the next concrete task or shut the team down/, 'all-workers-idle nudge should include a next action');
+      assert.match(tmuxLog, /Next: run omx team status both-hooks, read unread worker messages, then decide whether to assign the next concrete task, reconcile results, or shut the team down/, 'all-workers-idle nudge should include a next action');
     });
   });
 });

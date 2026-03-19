@@ -1199,7 +1199,9 @@ async function refreshNativeAgentConfigs(
     }
 
     const promptContent = await readFile(promptPath, "utf-8");
-    const toml = generateAgentToml(agent, promptContent);
+    const toml = generateAgentToml(agent, promptContent, {
+      codexHomeOverride: join(agentsDir, ".."),
+    });
     const dst = join(agentsDir, `${name}.toml`);
     await syncManagedContent(
       toml,
@@ -1522,7 +1524,7 @@ async function setupNotifyHook(
   pkgRoot: string,
   options: Pick<SetupOptions, "dryRun" | "verbose">,
 ): Promise<void> {
-  const hookScript = join(pkgRoot, "scripts", "notify-hook.js");
+  const hookScript = join(pkgRoot, "dist", "scripts", "notify-hook.js");
   if (!existsSync(hookScript)) {
     if (options.verbose)
       console.log("  Notify hook script not found, skipping.");

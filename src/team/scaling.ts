@@ -40,6 +40,7 @@ import {
   teamMarkDispatchRequestNotified as markDispatchRequestNotified,
   teamReadDispatchRequest as readDispatchRequest,
   teamTransitionDispatchRequest as transitionDispatchRequest,
+  type TeamConfig,
   type WorkerInfo,
   type WorkerStatus,
 } from './team-ops.js';
@@ -52,6 +53,8 @@ import {
   generateInitialInbox,
   generateTriggerMessage,
   writeWorkerRoleInstructionsFile,
+  writeWorkerWorktreeRootAgentsFile,
+  removeWorkerWorktreeRootAgentsFile,
 } from './worker-bootstrap.js';
 import { loadRolePrompt } from './role-router.js';
 import { codexPromptsDir } from '../utils/paths.js';
@@ -63,6 +66,13 @@ import {
   type TeamReasoningEffort,
 } from './model-contract.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
+import {
+  ensureWorktree,
+  planWorktreeTarget,
+  rollbackProvisionedWorktrees,
+  type EnsureWorktreeResult,
+  type WorktreeMode,
+} from './worktree.js';
 
 // ── Environment gate ──────────────────────────────────────────────────────────
 
@@ -106,6 +116,51 @@ export interface ScaleError {
 
 function resolveInstructionStateRoot(worktreePath?: string | null): string | undefined {
   return worktreePath ? WORKTREE_TRIGGER_STATE_ROOT : undefined;
+}
+
+function resolveLegacyScaledTeamWorktreeMode(config: Pick<TeamConfig, 'name' | 'workspace_mode' | 'worktree_mode' | 'workers'>): WorktreeMode {
+  if (config.worktree_mode) return config.worktree_mode;
+  if (config.workspace_mode !== 'worktree') return { enabled: false };
+
+  const workersWithMetadata = config.workers.filter((worker) =>
+    worker.worktree_path || worker.worktree_branch || typeof worker.worktree_detached === 'boolean',
+  );
+  if (workersWithMetadata.length === 0) {
+    throw new Error(`scale_up_missing_team_worktree_contract:${config.name}`);
+  }
+
+  if (workersWithMetadata.some((worker) => worker.worktree_detached === true)) {
+    return { enabled: true, detached: true, name: null };
+  }
+
+  const branchPrefixes = new Set(
+    workersWithMetadata
+      .map((worker) => worker.worktree_branch?.trim())
+      .filter((branch): branch is string => Boolean(branch))
+      .map((branch) => {
+        const match = /^(.*)\/worker-\d+$/.exec(branch);
+        return match?.[1]?.trim() || '';
+      })
+      .filter(Boolean),
+  );
+
+  if (branchPrefixes.size === 1) {
+    return { enabled: true, detached: false, name: [...branchPrefixes][0] };
+  }
+
+  throw new Error(`scale_up_missing_team_worktree_contract:${config.name}`);
+}
+
+function resolveScaleUpWorktreeMode(config: TeamConfig): WorktreeMode {
+  if (config.workspace_mode !== 'worktree') return { enabled: false };
+  try {
+    return resolveLegacyScaledTeamWorktreeMode(config);
+  } catch (error) {
+    if (error instanceof Error && error.message === `scale_up_missing_team_worktree_contract:${config.name}`) {
+      return { enabled: true, detached: true, name: null };
+    }
+    throw error;
+  }
 }
 
 async function notifyWorkerPaneOutcome(
@@ -178,6 +233,11 @@ export async function scaleUp(
       display_mode: manifest?.policy?.display_mode === 'split_pane' ? 'split_pane' : 'auto',
       worker_launch_mode: config.worker_launch_mode,
     });
+    const effectiveWorktreeMode = config.worktree_mode ?? resolveScaleUpWorktreeMode(config);
+    if (!config.worktree_mode && effectiveWorktreeMode.enabled) {
+      config.worktree_mode = effectiveWorktreeMode;
+      await saveTeamConfig(config, leaderCwd);
+    }
 
     // Resolve the monotonic worker index counter
     let nextIndex = config.next_worker_index ?? (currentCount + 1);
@@ -185,7 +245,10 @@ export async function scaleUp(
     const addedWorkers: WorkerInfo[] = [];
     const createdTaskIds: string[] = [];
 
-    const rollbackScaleUp = async (error: string, paneId?: string): Promise<ScaleError> => {
+    const rollbackScaleUp = async (
+      error: string,
+      context: { paneId?: string; workerName?: string; worktreePath?: string } = {},
+    ): Promise<ScaleError> => {
       for (const w of addedWorkers) {
         const idx = config.workers.findIndex((worker) => worker.name === w.name);
         if (idx >= 0) {
@@ -196,11 +259,27 @@ export async function scaleUp(
             execFileSync('tmux', ['kill-pane', '-t', w.pane_id], { stdio: 'pipe' });
           }
         } catch {}
+        if (w.worktree_path) {
+          await removeWorkerWorktreeRootAgentsFile(sanitized, w.name, teamStateRoot, w.worktree_path).catch(() => {});
+        }
       }
 
-      if (paneId) {
+      if (
+        context.workerName &&
+        context.worktreePath &&
+        !addedWorkers.some((worker) => worker.name === context.workerName)
+      ) {
+        await removeWorkerWorktreeRootAgentsFile(
+          sanitized,
+          context.workerName,
+          teamStateRoot,
+          context.worktreePath,
+        ).catch(() => {});
+      }
+
+      if (context.paneId) {
         try {
-          execFileSync('tmux', ['kill-pane', '-t', paneId], { stdio: 'pipe' });
+          execFileSync('tmux', ['kill-pane', '-t', context.paneId], { stdio: 'pipe' });
         } catch {}
       }
 
@@ -253,25 +332,55 @@ export async function scaleUp(
         console.log(`[omx:scaling] ${workerName}: mixed task roles [${[...uniqueTaskRoles].join(', ')}], falling back to ${agentType}`);
       }
 
+      const worktreeMode = resolveScaleUpWorktreeMode(config);
+      const workerWorkspaceResult = worktreeMode.enabled
+        ? ensureWorktree(planWorktreeTarget({
+            cwd: leaderCwd,
+            scope: 'team',
+            mode: worktreeMode,
+            teamName: sanitized,
+            workerName,
+          }))
+        : { enabled: false } as const;
+      const workerWorkspace = workerWorkspaceResult.enabled ? workerWorkspaceResult : null;
+      const workerCwd = workerWorkspace ? workerWorkspace.worktreePath : leaderCwd;
+
       // Build startup command and create tmux pane
       const rolePromptContent = await loadRolePrompt(workerRole, join(leaderCwd, '.codex', 'prompts'))
         ?? await loadRolePrompt(workerRole, codexPromptsDir());
       const teamInstructionsPath = join(leaderCwd, '.omx', 'state', 'team', sanitized, 'worker-agents.md');
-      const instructionsFilePath = rolePromptContent
-        ? await writeWorkerRoleInstructionsFile(sanitized, workerName, leaderCwd, teamInstructionsPath, workerRole, rolePromptContent)
-        : teamInstructionsPath;
+      const instructionsFilePath = workerWorkspace
+        ? await writeWorkerWorktreeRootAgentsFile({
+            teamName: sanitized,
+            workerName,
+            workerRole,
+            rolePromptContent: rolePromptContent ?? '',
+            teamStateRoot,
+            leaderCwd,
+            worktreePath: workerWorkspace.worktreePath,
+          })
+        : rolePromptContent
+          ? await writeWorkerRoleInstructionsFile(sanitized, workerName, leaderCwd, teamInstructionsPath, workerRole, rolePromptContent)
+          : teamInstructionsPath;
       const extraEnv: Record<string, string> = {
         OMX_TEAM_STATE_ROOT: teamStateRoot,
         OMX_TEAM_LEADER_CWD: leaderCwd,
         OMX_MODEL_INSTRUCTIONS_FILE: instructionsFilePath,
       };
+      if (workerWorkspace) {
+        extraEnv.OMX_TEAM_WORKTREE_PATH = workerWorkspace.worktreePath;
+        if (workerWorkspace.branchName) {
+          extraEnv.OMX_TEAM_WORKTREE_BRANCH = workerWorkspace.branchName;
+        }
+        extraEnv.OMX_TEAM_WORKTREE_DETACHED = workerWorkspace.detached ? '1' : '0';
+      }
       const preferredReasoning = resolveAgentReasoningEffort(workerRole) ?? resolveAgentReasoningEffort(agentType);
       const workerLaunchArgs = resolveWorkerLaunchArgsForScaling(env, agentType, preferredReasoning);
       const cmd = buildWorkerStartupCommand(
         sanitized,
         workerIndex,
         workerLaunchArgs,
-        leaderCwd,
+        workerCwd,
         extraEnv,
         workerCliPlan[i],
       );
@@ -285,16 +394,23 @@ export async function scaleUp(
       const splitDirection = splitTarget === (config.leader_pane_id ?? '') ? '-h' : '-v';
 
       const result = spawnSync('tmux', [
-        'split-window', splitDirection, '-t', splitTarget, '-d', '-P', '-F', '#{pane_id}', '-c', leaderCwd, cmd,
+        'split-window', splitDirection, '-t', splitTarget, '-d', '-P', '-F', '#{pane_id}', '-c', workerCwd, cmd,
       ], { encoding: 'utf-8' });
 
       if (result.status !== 0) {
-        return await rollbackScaleUp(`Failed to create tmux pane for ${workerName}: ${(result.stderr || '').trim()}`);
+        return await rollbackScaleUp(
+          `Failed to create tmux pane for ${workerName}: ${(result.stderr || '').trim()}`,
+          { workerName, worktreePath: workerWorkspace?.worktreePath },
+        );
       }
 
       const paneId = (result.stdout || '').trim().split('\n')[0]?.trim();
       if (!paneId || !paneId.startsWith('%')) {
-        return await rollbackScaleUp(`Failed to capture pane ID for ${workerName}`);
+        return await rollbackScaleUp(`Failed to capture pane ID for ${workerName}`, {
+          paneId,
+          workerName,
+          worktreePath: workerWorkspace?.worktreePath,
+        });
       }
 
       // Intentionally avoid forcing `select-layout tiled` here.
@@ -311,7 +427,12 @@ export async function scaleUp(
         assigned_tasks: [],
         pid: panePid ?? undefined,
         pane_id: paneId,
-        working_dir: leaderCwd,
+        working_dir: workerCwd,
+        worktree_repo_root: workerWorkspace ? workerWorkspace.repoRoot : undefined,
+        worktree_path: workerWorkspace ? workerWorkspace.worktreePath : undefined,
+        worktree_branch: workerWorkspace ? (workerWorkspace.branchName ?? undefined) : undefined,
+        worktree_detached: workerWorkspace ? workerWorkspace.detached : undefined,
+        worktree_created: workerWorkspace ? workerWorkspace.created : undefined,
         team_state_root: teamStateRoot,
       };
 
@@ -335,6 +456,7 @@ export async function scaleUp(
         leaderCwd,
         workerRole,
         rolePromptContent: rolePromptContent ?? undefined,
+        worktreeRootAgentsCanonical: Boolean(workerWorkspace?.worktreePath),
       });
 
       const trigger = generateTriggerMessage(
@@ -455,7 +577,11 @@ export async function scaleUp(
         }
       }
       if (!outcome.ok) {
-        return await rollbackScaleUp(`scale_up_dispatch_failed:${workerName}:${outcome.reason}`, paneId);
+        return await rollbackScaleUp(`scale_up_dispatch_failed:${workerName}:${outcome.reason}`, {
+          paneId,
+          workerName,
+          worktreePath: workerWorkspace?.worktreePath,
+        });
       }
 
       addedWorkers.push(workerInfo);
@@ -606,8 +732,37 @@ export async function scaleDown(
       leaderPaneId,
       hudPaneId,
     });
+    const detachedWorktreesToRollback: EnsureWorktreeResult[] = targetWorkers
+      .filter((worker) =>
+        worker.worktree_created === true
+        && worker.worktree_detached === true
+        && typeof worker.worktree_repo_root === 'string'
+        && worker.worktree_repo_root.length > 0
+        && typeof worker.worktree_path === 'string'
+        && worker.worktree_path.length > 0,
+      )
+      .map((worker) => ({
+        enabled: true,
+        repoRoot: worker.worktree_repo_root as string,
+        worktreePath: resolve(worker.worktree_path as string),
+        detached: true,
+        branchName: null,
+        created: true,
+        reused: false,
+        createdBranch: false,
+      }));
+    if (detachedWorktreesToRollback.length > 0) {
+      try {
+        await rollbackProvisionedWorktrees(detachedWorktreesToRollback);
+      } catch (error) {
+        return { ok: false, error: `scale_down_worktree_cleanup_failed:${String(error)}` };
+      }
+    }
 
     for (const w of targetWorkers) {
+      if (w.worktree_path) {
+        await removeWorkerWorktreeRootAgentsFile(sanitized, w.name, w.team_state_root ?? config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd), w.worktree_path).catch(() => {});
+      }
       removedNames.push(w.name);
     }
 

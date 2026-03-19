@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const NOTIFY_HOOK_SCRIPT = new URL('../../../scripts/notify-hook.js', import.meta.url);
+const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', import.meta.url);
 
 async function withTempWorkingDir(run: (cwd: string) => Promise<void>): Promise<void> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-notify-all-idle-'));
@@ -63,6 +63,9 @@ function runNotifyHookAsWorker(
       ...process.env,
       PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
       OMX_TEAM_WORKER: workerEnv,
+      OMX_TEAM_STATE_ROOT: join(cwd, '.omx', 'state'),
+      OMX_TEAM_LEADER_CWD: '',
+      OMX_MODEL_INSTRUCTIONS_FILE: '',
       OMX_TEAM_WORKER_IDLE_NOTIFY: 'false',
       OMX_TEAM_ALL_IDLE_COOLDOWN_MS: '500', // short cooldown for tests
       TMUX: '',
@@ -658,6 +661,9 @@ exit 0
           ...process.env,
           PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
           OMX_TEAM_WORKER: '', // empty = not a worker
+          OMX_TEAM_STATE_ROOT: '',
+          OMX_TEAM_LEADER_CWD: '',
+          OMX_MODEL_INSTRUCTIONS_FILE: '',
           TMUX: '',
           TMUX_PANE: '',
         },
@@ -711,7 +717,7 @@ exit 0
       assert.ok(existsSync(tmuxLogPath), 'tmux should have been called');
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /\[OMX\] All 1 worker idle/, 'single worker uses singular form');
-      assert.match(tmuxLog, /Next: run omx team status solo-team, check unread worker messages, then assign the next concrete task or shut the team down/, 'all-workers-idle notification should include a next action');
+      assert.match(tmuxLog, /Next: run omx team status solo-team, read unread worker messages, then decide whether to assign the next concrete task, reconcile results, or shut the team down/, 'all-workers-idle notification should include a next action');
       assert.doesNotMatch(tmuxLog, /All 1 workers idle/, 'should not use plural for single worker');
     });
   });
