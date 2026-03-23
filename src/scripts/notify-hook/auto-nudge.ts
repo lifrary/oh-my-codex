@@ -5,6 +5,7 @@
  */
 
 import { readFile, writeFile } from 'fs/promises';
+import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { asNumber, safeString } from './utils.js';
@@ -169,6 +170,32 @@ async function persistSkillActiveState(stateDir, state) {
   await writeFile(join(stateDir, SKILL_ACTIVE_STATE_FILE), JSON.stringify(state, null, 2)).catch(() => {});
 }
 
+
+export async function isDeepInterviewStateActive(stateDir) {
+  const modeState = await readJsonIfExists(join(stateDir, 'deep-interview-state.json'), null);
+  return Boolean(modeState && modeState.active === true);
+}
+
+export async function resolveAutoNudgeSignature(stateDir, payload, lastMessage = '') {
+  const normalizedMessage = safeString(lastMessage).trim();
+  const hudState = await readJsonIfExists(join(stateDir, 'hud-state.json'), null);
+  const hudTurnAt = safeString(hudState?.last_turn_at).trim();
+  const hudTurnCount = Number.isFinite(hudState?.turn_count) ? hudState.turn_count : null;
+  const hudMessage = safeString(hudState?.last_agent_output || hudState?.last_agent_message || '').trim();
+
+  if (normalizedMessage && hudTurnAt && hudTurnCount !== null && hudMessage === normalizedMessage) {
+    return `hud:${hudTurnCount}|${hudTurnAt}|${normalizedMessage}`;
+  }
+
+  const threadId = safeString(payload?.['thread-id'] || payload?.thread_id).trim();
+  const turnId = safeString(payload?.['turn-id'] || payload?.turn_id).trim();
+  if (normalizedMessage && (threadId || turnId)) {
+    return `payload:${threadId}|${turnId}|${normalizedMessage}`;
+  }
+
+  return normalizedMessage ? `message:${normalizedMessage}` : '';
+}
+
 function latestUserInputFromPayload(payload) {
   const inputMessages = payload['input-messages'] || payload.input_messages || [];
   if (!Array.isArray(inputMessages) || inputMessages.length === 0) return '';
@@ -238,6 +265,7 @@ export function normalizeAutoNudgeConfig(raw) {
       patterns: DEFAULT_STALL_PATTERNS,
       response: 'yes, proceed',
       delaySec: 3,
+      stallMs: 5000,
       maxNudgesPerSession: Infinity,
     };
   }
@@ -252,6 +280,9 @@ export function normalizeAutoNudgeConfig(raw) {
     delaySec: typeof raw.delaySec === 'number' && raw.delaySec >= 0 && raw.delaySec <= 60
       ? raw.delaySec
       : 3,
+    stallMs: typeof raw.stallMs === 'number' && raw.stallMs >= 0 && raw.stallMs <= 60_000
+      ? raw.stallMs
+      : 5000,
     maxNudgesPerSession: typeof raw.maxNudgesPerSession === 'number' && raw.maxNudgesPerSession > 0
       ? raw.maxNudgesPerSession
       : Infinity,
@@ -287,11 +318,71 @@ export async function capturePane(paneId, lines = 10) {
   }
 }
 
-export async function resolveNudgePaneTarget(stateDir: any) {
+function resolveCodexPaneByCwdFallback(cwd) {
+  const normalizedCwd = safeString(cwd).trim();
+  if (!normalizedCwd) return '';
+
+  try {
+    const panes = execFileSync('tmux', [
+      'list-panes', '-a', '-F', '#{pane_id}	#{pane_current_path}	#{pane_current_command}	#{pane_start_command}',
+    ], { encoding: 'utf-8', timeout: 2000 })
+      .trim()
+      .split('\n')
+      .filter(Boolean);
+
+    for (const line of panes) {
+      const [paneId, panePath = '', paneCommand = '', startCommand = ''] = line.split('\t');
+      const normalizedPanePath = safeString(panePath).trim();
+      const normalizedStart = safeString(startCommand).toLowerCase();
+      const normalizedCommand = safeString(paneCommand).trim().toLowerCase();
+      if (!paneId || normalizedPanePath !== normalizedCwd) continue;
+      if (/\bomx\b.*\bhud\b.*--watch/i.test(normalizedStart)) continue;
+      if (normalizedStart.includes('codex')) return paneId;
+      if (normalizedCommand === 'codex' || normalizedCommand === 'node' || normalizedCommand === 'npx') return paneId;
+    }
+  } catch {
+    // Fall back to empty when tmux scan is unavailable.
+  }
+
+  return '';
+}
+
+async function resolveCodexPaneFromAnchor(anchorPane) {
+  const paneId = safeString(anchorPane).trim();
+  if (!paneId) return '';
+
+  try {
+    const sessionResult = await runProcess('tmux', ['display-message', '-t', paneId, '-p', '#S'], 2000);
+    const sessionName = safeString(sessionResult.stdout).trim();
+    if (!sessionName) return '';
+
+    const panesResult = await runProcess(
+      'tmux',
+      ['list-panes', '-s', '-t', sessionName, '-F', '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}'],
+      2000,
+    );
+    const panes = safeString(panesResult.stdout).trim().split('\n').filter(Boolean);
+    for (const line of panes) {
+      const [candidatePaneId, , rawStartCommand = ''] = line.split('\t');
+      const startCommand = safeString(rawStartCommand).toLowerCase();
+      if (!candidatePaneId) continue;
+      if (/\bomx\b.*\bhud\b.*--watch/i.test(startCommand)) continue;
+      if (startCommand.includes('codex')) return candidatePaneId;
+    }
+  } catch {
+    // Fall back to the anchored pane when session scanning is unavailable.
+  }
+
+  return '';
+}
+
+export async function resolveNudgePaneTarget(stateDir: any, cwd = '') {
   // Use canonical codex pane resolver — validates pane is running an agent, not a shell
   const { resolveCodexPane } = await import('../tmux-hook-engine.js');
   const codexPane = resolveCodexPane();
   if (codexPane) return codexPane;
+
+  let fallbackPane = '';
 
   try {
     const scopedDirs = await getScopedStateDirsForCurrentSession(stateDir);
@@ -303,7 +394,11 @@ export async function resolveNudgePaneTarget(stateDir: any) {
         try {
           const state = JSON.parse(await readFile(path, 'utf-8'));
           if (state && state.active && state.tmux_pane_id) {
-            return safeString(state.tmux_pane_id);
+            const anchoredPane = safeString(state.tmux_pane_id).trim();
+            if (!anchoredPane) continue;
+            const upgradedPane = await resolveCodexPaneFromAnchor(anchoredPane);
+            if (upgradedPane) return upgradedPane;
+            if (!fallbackPane) fallbackPane = anchoredPane;
           }
         } catch {
           // skip malformed state
@@ -314,7 +409,9 @@ export async function resolveNudgePaneTarget(stateDir: any) {
     // Non-critical
   }
 
-  return '';
+  if (fallbackPane) return fallbackPane;
+
+  return resolveCodexPaneByCwdFallback(cwd);
 }
 
 export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload }) {
@@ -339,12 +436,12 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload }) {
     const nudgeStatePath = join(stateDir, 'auto-nudge-state.json');
     let nudgeState = await readJsonIfExists(nudgeStatePath, null);
     if (!nudgeState || typeof nudgeState !== 'object') {
-      nudgeState = { nudgeCount: 0, lastNudgeAt: '' };
+      nudgeState = { nudgeCount: 0, lastNudgeAt: '', lastSignature: '' };
     }
     const nudgeCount = asNumber(nudgeState.nudgeCount) ?? 0;
     if (Number.isFinite(config.maxNudgesPerSession) && nudgeCount >= config.maxNudgesPerSession) return;
 
-    const paneId = await resolveNudgePaneTarget(stateDir);
+    const paneId = await resolveNudgePaneTarget(stateDir, cwd);
 
     let detected = detectStallPattern(lastMessage, config.patterns);
     let source = 'payload';
@@ -357,6 +454,26 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload }) {
 
     if (skillState?.phase === 'completing' && !detected) return;
     if (!detected || !paneId) return;
+
+    const signature = await resolveAutoNudgeSignature(stateDir, payload, lastMessage);
+    if (signature && safeString(nudgeState.lastSignature) === signature) return;
+
+    const sourceName = safeString(payload?.source || '');
+    const isFallbackWatcherSource = sourceName === 'notify-fallback-watcher-stall';
+    if (!isFallbackWatcherSource && config.stallMs > 0) {
+      nudgeState.pendingSignature = signature;
+      nudgeState.pendingSince = new Date().toISOString();
+      await writeFile(nudgeStatePath, JSON.stringify(nudgeState, null, 2)).catch(() => {});
+      await logTmuxHookEvent(logsDir, {
+        timestamp: new Date().toISOString(),
+        type: 'auto_nudge_skipped',
+        reason: 'stall_window_pending',
+        source,
+        stall_ms: config.stallMs,
+        signature,
+      }).catch(() => {});
+      return;
+    }
 
     const paneGuard = await evaluatePaneInjectionReadiness(paneId, { skipIfScrolling: true });
     if (!paneGuard.ok) {
@@ -414,6 +531,9 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload }) {
 
       nudgeState.nudgeCount = nudgeCount + 1;
       nudgeState.lastNudgeAt = nowIso;
+      nudgeState.lastSignature = signature;
+      nudgeState.pendingSignature = '';
+      nudgeState.pendingSince = '';
       await writeFile(nudgeStatePath, JSON.stringify(nudgeState, null, 2)).catch(() => {});
 
       if (skillState && skillState.phase === 'planning') {

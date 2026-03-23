@@ -33,6 +33,9 @@ import {
   resolveNotifyTempContract,
   buildNotifyTempStartupMessages,
   buildNotifyFallbackWatcherEnv,
+  resolveNotifyFallbackWatcherScript,
+  resolveHookDerivedWatcherScript,
+  resolveNotifyHookScript,
 } from "../index.js";
 import { HUD_TMUX_HEIGHT_LINES } from "../../hud/constants.js";
 import {
@@ -234,24 +237,45 @@ describe("resolveNotifyTempContract", () => {
   });
 });
 
+describe("watcher script path resolution", () => {
+  it("resolves packaged watcher entrypoints from dist/scripts", () => {
+    assert.equal(
+      resolveNotifyFallbackWatcherScript("/pkg"),
+      "/pkg/dist/scripts/notify-fallback-watcher.js",
+    );
+    assert.equal(
+      resolveHookDerivedWatcherScript("/pkg"),
+      "/pkg/dist/scripts/hook-derived-watcher.js",
+    );
+    assert.equal(
+      resolveNotifyHookScript("/pkg"),
+      "/pkg/dist/scripts/notify-hook.js",
+    );
+  });
+});
+
 describe("buildNotifyFallbackWatcherEnv", () => {
   it("enables watcher authority and propagates CODEX_HOME override when requested", () => {
     const env = buildNotifyFallbackWatcherEnv(
-      { HOME: "/tmp/home", OMX_HUD_AUTHORITY: "0" },
+      { HOME: "/tmp/home", OMX_HUD_AUTHORITY: "0", TMUX: "sock,1,0", TMUX_PANE: "%2" },
       { codexHomeOverride: "/tmp/codex-home", enableAuthority: true },
     );
     assert.equal(env.OMX_HUD_AUTHORITY, "1");
     assert.equal(env.CODEX_HOME, "/tmp/codex-home");
     assert.equal(env.HOME, "/tmp/home");
+    assert.equal(env.TMUX, undefined);
+    assert.equal(env.TMUX_PANE, undefined);
   });
 
   it("disables watcher authority explicitly when not requested", () => {
     const env = buildNotifyFallbackWatcherEnv(
-      { HOME: "/tmp/home", OMX_HUD_AUTHORITY: "1" },
+      { HOME: "/tmp/home", OMX_HUD_AUTHORITY: "1", TMUX: "sock,1,0", TMUX_PANE: "%3" },
       { enableAuthority: false },
     );
     assert.equal(env.OMX_HUD_AUTHORITY, "0");
     assert.equal(env.HOME, "/tmp/home");
+    assert.equal(env.TMUX, undefined);
+    assert.equal(env.TMUX_PANE, undefined);
   });
 });
 

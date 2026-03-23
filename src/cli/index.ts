@@ -95,6 +95,18 @@ import {
   type ParseNotifyTempContractResult,
 } from "../notifications/temp-contract.js";
 
+export function resolveNotifyFallbackWatcherScript(pkgRoot = getPackageRoot()): string {
+  return join(pkgRoot, "dist", "scripts", "notify-fallback-watcher.js");
+}
+
+export function resolveHookDerivedWatcherScript(pkgRoot = getPackageRoot()): string {
+  return join(pkgRoot, "dist", "scripts", "hook-derived-watcher.js");
+}
+
+export function resolveNotifyHookScript(pkgRoot = getPackageRoot()): string {
+  return join(pkgRoot, "dist", "scripts", "notify-hook.js");
+}
+
 const HELP = `
 oh-my-codex (omx) - Multi-agent orchestration for Codex CLI
 
@@ -1554,8 +1566,11 @@ export function buildNotifyFallbackWatcherEnv(
     enableAuthority?: boolean;
   } = {},
 ): NodeJS.ProcessEnv {
+  const nextEnv = { ...env };
+  delete nextEnv.TMUX;
+  delete nextEnv.TMUX_PANE;
   return {
-    ...env,
+    ...nextEnv,
     ...(options.codexHomeOverride ? { CODEX_HOME: options.codexHomeOverride } : {}),
     OMX_HUD_AUTHORITY: options.enableAuthority ? "1" : "0",
   };
@@ -2254,8 +2269,8 @@ async function startNotifyFallbackWatcher(
   const { mkdir, writeFile, readFile } = await import("fs/promises");
   const pidPath = notifyFallbackPidPath(cwd);
   const pkgRoot = getPackageRoot();
-  const watcherScript = join(pkgRoot, "scripts", "notify-fallback-watcher.js");
-  const notifyScript = join(pkgRoot, "dist", "scripts", "notify-hook.js");
+  const watcherScript = resolveNotifyFallbackWatcherScript(pkgRoot);
+  const notifyScript = resolveNotifyHookScript(pkgRoot);
   if (!existsSync(watcherScript) || !existsSync(notifyScript)) return;
 
   // Stop stale watcher from a previous run.
@@ -2341,7 +2356,7 @@ async function startHookDerivedWatcher(cwd: string): Promise<void> {
   const { mkdir, writeFile, readFile } = await import("fs/promises");
   const pidPath = hookDerivedWatcherPidPath(cwd);
   const pkgRoot = getPackageRoot();
-  const watcherScript = join(pkgRoot, "scripts", "hook-derived-watcher.js");
+  const watcherScript = resolveHookDerivedWatcherScript(pkgRoot);
   if (!existsSync(watcherScript)) return;
 
   if (existsSync(pidPath)) {
@@ -2466,8 +2481,8 @@ async function flushNotifyFallbackOnce(
 ): Promise<void> {
   const { spawnSync } = await import("child_process");
   const pkgRoot = getPackageRoot();
-  const watcherScript = join(pkgRoot, "scripts", "notify-fallback-watcher.js");
-  const notifyScript = join(pkgRoot, "dist", "scripts", "notify-hook.js");
+  const watcherScript = resolveNotifyFallbackWatcherScript(pkgRoot);
+  const notifyScript = resolveNotifyHookScript(pkgRoot);
   if (!existsSync(watcherScript) || !existsSync(notifyScript)) return;
   spawnSync(
     process.execPath,
@@ -2488,7 +2503,7 @@ async function flushHookDerivedWatcherOnce(cwd: string): Promise<void> {
   if (process.env.OMX_HOOK_DERIVED_SIGNALS !== "1") return;
   const { spawnSync } = await import("child_process");
   const pkgRoot = getPackageRoot();
-  const watcherScript = join(pkgRoot, "scripts", "hook-derived-watcher.js");
+  const watcherScript = resolveHookDerivedWatcherScript(pkgRoot);
   if (!existsSync(watcherScript)) return;
   spawnSync(process.execPath, [watcherScript, "--once", "--cwd", cwd], {
     cwd,
@@ -2560,26 +2575,8 @@ async function cancelModes(): Promise<void> {
     const ralphLinksUltrawork = (state: Record<string, unknown>): boolean =>
       state.linked_ultrawork === true || state.linked_mode === "ultrawork";
 
-    const team = states.get("team");
     const ralph = states.get("ralph");
     const hadActiveRalph = !!(ralph && ralph.state.active === true);
-
-    if (
-      team &&
-      team.state.active === true &&
-      team.state.linked_ralph === true
-    ) {
-      cancelMode("team", "cancelled", true);
-      if (ralph && ralph.state.linked_team === true) {
-        cancelMode("ralph", "cancelled", true);
-        ralph.state.linked_team_terminal_phase = "cancelled";
-        ralph.state.linked_team_terminal_at = nowIso;
-        changed.add("ralph");
-        if (ralphLinksUltrawork(ralph.state))
-          cancelMode("ultrawork", "cancelled", true);
-      }
-    }
-
     if (ralph && ralph.state.active === true) {
       cancelMode("ralph", "cancelled", true);
       if (ralphLinksUltrawork(ralph.state))

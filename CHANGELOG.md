@@ -4,6 +4,102 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.11.8] - 2026-03-23
+
+Hotfix release for deep-interview nudge suppression and duplicate fresh-leader nudge prevention.
+
+### Fixed
+- **Deep-interview nudge suppression** — when deep-interview state is present, notify-hook and the fallback watcher now suppress leader nudges, worker-idle nudges, Ralph continue-steers, and auto-nudges so the interview can proceed without automated interruptions.
+- **Fresh leader dedupe hardening** — fallback watcher leader nudges now stay stale-only, while notify-hook regression coverage proves the same fresh mailbox message does not re-trigger repeated leader nudges.
+
+### Changed
+- **Release metadata sync** — Node and Cargo package metadata are bumped to `0.11.8` for this hotfix release.
+
+### Verified
+- `npm run build`
+- `node --test --test-reporter=spec dist/hooks/__tests__/notify-hook-auto-nudge.test.js`
+- `node --test --test-reporter=spec dist/hooks/__tests__/notify-hook-team-leader-nudge.test.js`
+- `node --test --test-reporter=spec dist/hooks/__tests__/notify-fallback-watcher.test.js`
+
+## [0.11.7] - 2026-03-23
+
+Patch release for degraded-state auto-nudge recovery, tighter team control-plane correctness, and release metadata consistency across the `v0.11.6..dev` hotfix train.
+
+### Fixed
+- **Watcher / dispatch recovery** — team dispatch now resolves the shared runtime binary correctly, fallback watcher cooldowns debounce across processes, persisted dispatch IDs stay aligned with runtime bridge request IDs, and successful tmux fallback delivery recovers requests back to `notified`. (PRs #1002, #1004, #1020, #1021)
+- **Leader nudge accuracy** — completed or foreign-session teams no longer resurface as stale leader nudges, leader control remains mailbox-only, and advancing worker turn counts count as progress before a stall is declared. (PRs #1001, #1023)
+- **Linked Ralph + team lifecycle** — linked Ralph now stays alive for the full team run, prompt-mode launches skip the bridge correctly, duplicate leader mailbox sends are deduplicated, and missing-team cleanup now finalizes linked Ralph instead of leaving it active indefinitely. (PRs #1011, #1012, #1013, #1017, #1025)
+
+### Changed
+- **Generated defaults and prompt guidance** — the default status line now includes `weekly-limit`, exact `gpt-5.4-mini` worker/subagent launches get a narrower prompt seam, and AGENTS guidance now prefers the current frontier default over stale explicit child-model pins. (PRs #1009, #1016, #1018)
+- **Release metadata sync** — Node and Cargo release metadata are realigned to `0.11.7`, keeping the repo version-sync contract intact for the release branch. (release follow-up commit `c4c5b75`)
+
+### Verified
+- **Commit-window review** — parallel module review across `main...dev` found `3` main-only merge commits (`#995`, `#997`, `#1000`) but no main-only patch content after cherry-pick elimination, so the shipped release delta is entirely on the `dev` side.
+- **Targeted hook + watcher regression suite** — `notify-fallback-watcher` and `notify-hook auto-nudge` pass with the degraded-state coverage (`49/49` passing).
+- **Real tmux smoke for degraded auto-nudge** — a live Codex pane received `yes, proceed [OMX_TMUX_INJECT]` from the fallback watcher after a 5s stalled-turn window with only HUD state available.
+- **Real tmux smoke for Ralph anti-spam** — two back-to-back fallback watcher ticks did not emit repeated `Ralph loop active continue` sends; the persisted state stayed in cooldown (`startup_cooldown`).
+
+## [0.11.6] - 2026-03-21
+
+Patch release for Ralph continue-steer restart throttling.
+
+### Fixed
+- **Ralph continue-steer restart throttling** — fallback watcher cooldown anchors now survive restarts and malformed persisted timestamps, preventing repeated continue-steer injection spam after Ralph resumes. (PR [#998](https://github.com/Yeachan-Heo/oh-my-codex/pull/998), closes [#996](https://github.com/Yeachan-Heo/oh-my-codex/issues/996))
+
+## [0.11.5] - 2026-03-21
+
+Hotfix release for stale leader nudge false-positives and README onboarding clarity.
+
+### Fixed
+- **False-positive leader stale nudges** — leader activity freshness check now considers any recent leader activity, preventing spurious stale nudges when the leader is actively working. (PR [#993](https://github.com/Yeachan-Heo/oh-my-codex/pull/993))
+
+### Changed
+- **README onboarding refocused** — README now centers onboarding around the real default OMX path for clearer first-run guidance. (PR [#992](https://github.com/Yeachan-Heo/oh-my-codex/pull/992))
+
+## [0.11.4] - 2026-03-20
+
+
+Hotfix release for team worker delivery regressions.
+
+### Fixed
+- **Packaged watcher entrypoint resolution** — team fallback watcher startup and one-shot flush paths now resolve shipped `dist/scripts/*.js` entrypoints instead of nonexistent top-level `scripts/*.js`, restoring worker message delivery and state-change delivery in packed installs.
+- **CI smoke coverage for packaged watcher paths** — smoke CI now exercises the packaged watcher path-resolution contract so future release builds catch this class of regression before shipping.
+
+## [0.11.2] - 2026-03-20
+
+6 PRs landed since `v0.11.1`. Contributors: [@Yeachan-Heo](https://github.com/Yeachan-Heo).
+
+### Added
+- **Bidirectional Telegram/Discord reply support** — reply listeners now support polling-based bidirectional messaging for Telegram and Discord integrations. (PR [#984](https://github.com/Yeachan-Heo/oh-my-codex/pull/984))
+- **OMX SDK architecture enhancements** — improved SDK facade contracts and verification patterns for external integrations. (PR [#985](https://github.com/Yeachan-Heo/oh-my-codex/pull/985))
+
+### Fixed
+- **Deep-interview state mode compatibility** — deep-interview workflow now correctly uses OMX state APIs instead of legacy OMC state paths. (PR [#987](https://github.com/Yeachan-Heo/oh-my-codex/pull/987), closes [#1783](https://github.com/Yeachan-Heo/oh-my-codex/issues/1783))
+- **Real tmux test isolation** — tmux/session tests are now isolated from live maintainer sessions to prevent interference. (PR [#980](https://github.com/Yeachan-Heo/oh-my-codex/pull/980), closes [#960](https://github.com/Yeachan-Heo/oh-my-codex/issues/960))
+- **npm pack dry-run race condition** — prevented parallel test runs from rebuilding dist during npm pack dry-runs. (PR [#986](https://github.com/Yeachan-Heo/oh-my-codex/pull/986))
+- **Ambient tmux bootstrap restoration** — restored ambient tmux bootstrap for state tools with aligned fake tmux fixtures. (hotfix commits)
+
+### Changed
+- **Hook SDK documentation alignment** — unified hook enablement wording and messaging across help, init, and status commands.
+
+## [0.11.1] - 2026-03-20
+
+5 PRs landed since `v0.11.0`. Contributors: [@Yeachan-Heo](https://github.com/Yeachan-Heo).
+
+### Fixed
+- **Pane detection regression** — auto-nudge fixtures aligned with canonical pane routing, preventing hook nudges from landing in the HUD pane. (PR [#981](https://github.com/Yeachan-Heo/oh-my-codex/pull/981))
+- **Live session interference in tests** — tmux/session discovery is now isolated from live maintainer state. (PR [#979](https://github.com/Yeachan-Heo/oh-my-codex/pull/979), closes [#963](https://github.com/Yeachan-Heo/oh-my-codex/issues/963))
+- **Packed install strict allowlist** — explore harness now fails fast for non-rg allowlist misses while keeping packed installs alive without requiring ripgrep. (PR [#978](https://github.com/Yeachan-Heo/oh-my-codex/pull/978), closes [#964](https://github.com/Yeachan-Heo/oh-my-codex/issues/964))
+- **Release smoke focus** — smoke tests now focus on boot-safe packed installs. (PR [#983](https://github.com/Yeachan-Heo/oh-my-codex/pull/983), closes [#982](https://github.com/Yeachan-Heo/oh-my-codex/issues/982))
+
+### Changed
+- **CI workflow cleanup** — streamlined release smoke tests and reduced external tool dependencies in test environments.
+
+## [0.11.0] - 2026-03-19
+
+Version bump for release.
+
 ## [0.10.3] - 2026-03-18
 
 46 commits across 21 PRs from `v0.10.2..dev`. Contributors: [@Yeachan-Heo](https://github.com/Yeachan-Heo), [@lifrary](https://github.com/lifrary) (SEUNGWOO LEE).

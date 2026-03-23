@@ -5,6 +5,7 @@ import { execFileSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'node:url';
 import { safeString } from './utils.js';
+import { resolveRuntimeBinaryPath } from '../../runtime/bridge.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -26,7 +27,7 @@ import {
 function runtimeExec(command) {
   if (process.env.OMX_RUNTIME_BRIDGE === '0') return;
   try {
-    const binaryPath = resolve(__dirname, '../../target/debug/omx-runtime');
+    const binaryPath = resolveRuntimeBinaryPath();
     execFileSync(binaryPath, ['exec', JSON.stringify(command)], {
       timeout: 5000,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -231,9 +232,15 @@ async function withMailboxLock(teamDirPath, workerName, fn) {
   }
 }
 
+function resolveLeaderPaneId(config) {
+  return safeString(config?.leader_pane_id).trim();
+}
+
+
 function defaultInjectTarget(request, config) {
   if (request.to_worker === 'leader-fixed') {
-    if (config.leader_pane_id) return { type: 'pane', value: config.leader_pane_id };
+    const leaderPaneId = resolveLeaderPaneId(config);
+    if (leaderPaneId) return { type: 'pane', value: leaderPaneId };
     return null;
   }
   if (request.pane_id) return { type: 'pane', value: request.pane_id };
@@ -489,7 +496,7 @@ export async function drainPendingTeamDispatch({
           continue;
         }
 
-        if (request.to_worker === 'leader-fixed' && !safeString(config?.leader_pane_id).trim()) {
+        if (request.to_worker === 'leader-fixed' && !resolveLeaderPaneId(config)) {
           const nowIso = new Date().toISOString();
           const alreadyDeferred = safeString(request.last_reason).trim() === LEADER_PANE_MISSING_DEFERRED_REASON;
           request.updated_at = nowIso;

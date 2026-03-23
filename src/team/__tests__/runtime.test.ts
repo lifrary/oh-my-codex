@@ -908,8 +908,11 @@ process.on('SIGTERM', () => process.exit(0));
       const worker2Instructions = await readFile(join(cwd, '.omx', 'state', 'team', runtime.teamName, 'workers', 'worker-2', 'AGENTS.md'), 'utf-8');
       assert.match(worker1Instructions, /You are operating as the \*\*test-engineer\*\* role/);
       assert.match(worker1Instructions, /Test Engineer/);
+      assert.doesNotMatch(worker1Instructions, /exact gpt-5\.4-mini model/);
       assert.match(worker2Instructions, /You are operating as the \*\*writer\*\* role/);
       assert.match(worker2Instructions, /You are Writer\./);
+      assert.match(worker2Instructions, /exact gpt-5\.4-mini model/);
+      assert.match(worker2Instructions, /strict execution order: inspect -> plan -> act -> verify/);
 
       let worker1Args: string[] | null = null;
       let worker2Args: string[] | null = null;
@@ -951,6 +954,102 @@ process.on('SIGTERM', () => process.exit(0));
       else delete process.env.OMX_TEAM_WORKER_CLI;
       if (typeof prevCaptureDir === 'string') process.env.OMX_ARGV_CAPTURE_DIR = prevCaptureDir;
       else delete process.env.OMX_ARGV_CAPTURE_DIR;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam does not apply mini guidance for exact-match negatives like gpt-5.4-mini-tuned', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-mini-tuned-'));
+    const binDir = join(cwd, 'bin');
+    const fakeCodexPath = join(binDir, 'codex');
+    const captureDir = join(cwd, 'captures');
+    const promptsDir = join(cwd, '.codex', 'prompts');
+    await mkdir(binDir, { recursive: true });
+    await mkdir(captureDir, { recursive: true });
+    await mkdir(promptsDir, { recursive: true });
+    await writeFile(join(promptsDir, 'writer.md'), '<identity>You are Writer.</identity>');
+    await writeFile(
+      fakeCodexPath,
+      `#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const worker = String(process.env.OMX_TEAM_WORKER || 'unknown').replace(/[^a-zA-Z0-9_-]+/g, '__');
+const out = path.join(process.env.OMX_ARGV_CAPTURE_DIR, worker + '.json');
+fs.writeFileSync(out, JSON.stringify({ argv: process.argv.slice(2), worker }, null, 2));
+process.stdin.resume();
+setTimeout(() => process.exit(0), 5000);
+process.on('SIGTERM', () => process.exit(0));
+`,
+      { mode: 0o755 },
+    );
+
+    const prevPath = process.env.PATH;
+    const prevTmux = process.env.TMUX;
+    const prevLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevCaptureDir = process.env.OMX_ARGV_CAPTURE_DIR;
+    const prevLaunchArgs = process.env.OMX_TEAM_WORKER_LAUNCH_ARGS;
+
+    process.env.PATH = `${binDir}:${prevPath ?? ''}`;
+    delete process.env.TMUX;
+    process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'prompt';
+    process.env.OMX_TEAM_WORKER_CLI = 'codex';
+    process.env.OMX_ARGV_CAPTURE_DIR = captureDir;
+    process.env.OMX_TEAM_WORKER_LAUNCH_ARGS = '--model gpt-5.4-mini-tuned';
+
+    let runtime: TeamRuntime | null = null;
+    try {
+      runtime = await withoutTeamWorkerEnv(() =>
+        startTeam(
+          'team-mini-tuned-routing',
+          'mini tuned routing handoff',
+          'executor',
+          1,
+          [
+            { subject: 'document routing report only', description: 'document routing report only', owner: 'worker-1', role: 'writer' },
+          ],
+          cwd,
+        ));
+
+      const workerInstructions = await readFile(join(cwd, '.omx', 'state', 'team', runtime.teamName, 'workers', 'worker-1', 'AGENTS.md'), 'utf-8');
+      assert.match(workerInstructions, /You are operating as the \*\*writer\*\* role/);
+      assert.match(workerInstructions, /You are Writer\./);
+      assert.doesNotMatch(workerInstructions, /exact gpt-5\.4-mini model/);
+      assert.doesNotMatch(workerInstructions, /strict execution order: inspect -> plan -> act -> verify/);
+      assert.match(workerInstructions, /resolved_model: gpt-5\.4-mini-tuned/);
+
+      let workerArgs: string[] | null = null;
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        const workerPath = join(captureDir, 'team-mini-tuned-routing__worker-1.json');
+        if (existsSync(workerPath)) {
+          workerArgs = JSON.parse(await readFile(workerPath, 'utf-8')).argv;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+
+      assert.ok(workerArgs, 'worker argv capture file should be written');
+      const workerJoined = workerArgs!.join(' ');
+      assert.match(workerJoined, /--model gpt-5\.4-mini-tuned/);
+
+      await shutdownTeam(runtime.teamName, cwd, { force: true });
+      runtime = null;
+    } finally {
+      if (runtime) {
+        await shutdownTeam(runtime.teamName, cwd, { force: true }).catch(() => {});
+      }
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = prevLaunchMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevCaptureDir === 'string') process.env.OMX_ARGV_CAPTURE_DIR = prevCaptureDir;
+      else delete process.env.OMX_ARGV_CAPTURE_DIR;
+      if (typeof prevLaunchArgs === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_ARGS = prevLaunchArgs;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_ARGS;
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -1752,51 +1851,6 @@ process.on('SIGTERM', () => {
     }
   });
 
-  it('monitorTeam propagates linked terminal state into Ralph without waiting for notify-hook', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-linked-ralph-monitor-'));
-    try {
-      await initTeamState('team-linked-ralph-monitor', 'linked runtime sync test', 'executor', 1, cwd);
-      await createTask(
-        'team-linked-ralph-monitor',
-        {
-          subject: 'code change',
-          description: 'implement feature',
-          status: 'completed',
-          owner: 'worker-1',
-          requires_code_change: false,
-        },
-        cwd,
-      );
-
-      await writeFile(join(cwd, '.omx', 'state', 'team-state.json'), JSON.stringify({
-        active: true,
-        current_phase: 'team-exec',
-        linked_ralph: true,
-        team_name: 'team-linked-ralph-monitor',
-      }, null, 2));
-      await writeFile(join(cwd, '.omx', 'state', 'ralph-state.json'), JSON.stringify({
-        active: true,
-        iteration: 1,
-        max_iterations: 10,
-        current_phase: 'executing',
-        started_at: '2026-03-11T00:00:00.000Z',
-        linked_team: true,
-      }, null, 2));
-
-      const snapshot = await monitorTeam('team-linked-ralph-monitor', cwd);
-      assert.ok(snapshot);
-      assert.equal(snapshot?.phase, 'complete');
-
-      const ralphState = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'ralph-state.json'), 'utf-8')) as Record<string, unknown>;
-      assert.equal(ralphState.active, false);
-      assert.equal(ralphState.current_phase, 'complete');
-      assert.equal(ralphState.linked_team_terminal_phase, 'complete');
-      assert.ok(typeof ralphState.linked_team_terminal_at === 'string' && ralphState.linked_team_terminal_at);
-      assert.ok(typeof ralphState.completed_at === 'string' && ralphState.completed_at);
-    } finally {
-      await rm(cwd, { recursive: true, force: true });
-    }
-  });
 
   it('monitorTeam emits worker_state_changed, worker_idle, and task_completed events based on transitions', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-'));
@@ -2869,147 +2923,28 @@ esac
     }
   });
 
-  it('shutdownTeam ralph=true bypasses shutdown gate on failed tasks without throwing', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-ralph-gate-'));
+  it('shutdownTeam still throws on failed tasks', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-normal-gate-'));
     try {
-      await initTeamState('team-ralph-gate', 'ralph gate test', 'executor', 1, cwd);
+      await initTeamState('team-normal-gate', 'normal gate test', 'executor', 1, cwd);
       await createTask(
-        'team-ralph-gate',
-        { subject: 'failed task', description: 'd', status: 'failed' },
-        cwd,
-      );
-
-      // Without ralph, this would throw shutdown_gate_blocked
-      await shutdownTeam('team-ralph-gate', cwd, { ralph: true });
-      const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-ralph-gate');
-      assert.equal(existsSync(teamRoot), false);
-    } finally {
-      await rm(cwd, { recursive: true, force: true });
-    }
-  });
-
-  it('shutdownTeam ralph=true emits ralph_cleanup_policy event on gate bypass (failure-only)', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-ralph-event-'));
-    try {
-      await initTeamState('team-ralph-event', 'ralph event test', 'executor', 1, cwd);
-      await createTask(
-        'team-ralph-event',
-        { subject: 'failed task', description: 'd', status: 'failed' },
-        cwd,
-      );
-
-      const eventsPath = join(cwd, '.omx', 'state', 'team', 'team-ralph-event', 'events', 'events.ndjson');
-      // Read events before cleanup destroys them — but cleanup removes the directory,
-      // so we verify indirectly: ralph=true should not throw (gate bypass), and state is cleaned.
-      await shutdownTeam('team-ralph-event', cwd, { ralph: true });
-      const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-ralph-event');
-      assert.equal(existsSync(teamRoot), false);
-    } finally {
-      await rm(cwd, { recursive: true, force: true });
-    }
-  });
-
-  it('shutdownTeam ralph=true still throws when active work exists (pending/blocked/in_progress)', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-ralph-active-'));
-    try {
-      await initTeamState('team-ralph-active', 'ralph active work test', 'executor', 1, cwd);
-      await createTask(
-        'team-ralph-active',
-        { subject: 'pending task', description: 'd', status: 'pending' },
-        cwd,
-      );
-
-      // Ralph should NOT bypass when there are pending/blocked/in_progress tasks
-      await assert.rejects(
-        () => shutdownTeam('team-ralph-active', cwd, { ralph: true }),
-        /shutdown_gate_blocked:pending=1,blocked=0,in_progress=0,failed=0/,
-      );
-
-      const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-ralph-active');
-      assert.equal(existsSync(teamRoot), true);
-    } finally {
-      await rm(cwd, { recursive: true, force: true });
-    }
-  });
-
-  it('shutdownTeam ralph=true emits ralph_cleanup_summary event', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-ralph-summary-'));
-    try {
-      await initTeamState('team-ralph-summary', 'ralph summary test', 'executor', 1, cwd);
-      // All tasks completed — gate passes, but ralph summary is still emitted
-      await createTask(
-        'team-ralph-summary',
-        { subject: 'done', description: 'd', status: 'completed' },
-        cwd,
-      );
-
-      await shutdownTeam('team-ralph-summary', cwd, { ralph: true });
-      const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-ralph-summary');
-      assert.equal(existsSync(teamRoot), false);
-    } finally {
-      await rm(cwd, { recursive: true, force: true });
-    }
-  });
-
-  it('shutdownTeam ralph=true propagates linked Ralph cancellation before cleanup', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-linked-ralph-shutdown-'));
-    try {
-      await initTeamState('team-linked-ralph-shutdown', 'linked shutdown sync test', 'executor', 1, cwd);
-      await createTask(
-        'team-linked-ralph-shutdown',
-        { subject: 'done', description: 'd', status: 'completed' },
-        cwd,
-      );
-
-      await writeFile(join(cwd, '.omx', 'state', 'team-state.json'), JSON.stringify({
-        active: true,
-        current_phase: 'team-exec',
-        linked_ralph: true,
-        team_name: 'team-linked-ralph-shutdown',
-      }, null, 2));
-      await writeFile(join(cwd, '.omx', 'state', 'ralph-state.json'), JSON.stringify({
-        active: true,
-        iteration: 1,
-        max_iterations: 10,
-        current_phase: 'executing',
-        started_at: '2026-03-11T00:00:00.000Z',
-        linked_team: true,
-      }, null, 2));
-
-      await shutdownTeam('team-linked-ralph-shutdown', cwd, { ralph: true });
-
-      const ralphState = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'ralph-state.json'), 'utf-8')) as Record<string, unknown>;
-      assert.equal(ralphState.active, false);
-      assert.equal(ralphState.current_phase, 'cancelled');
-      assert.equal(ralphState.linked_team_terminal_phase, 'cancelled');
-      assert.ok(typeof ralphState.linked_team_terminal_at === 'string' && ralphState.linked_team_terminal_at);
-      assert.ok(typeof ralphState.completed_at === 'string' && ralphState.completed_at);
-    } finally {
-      await rm(cwd, { recursive: true, force: true });
-    }
-  });
-
-  it('shutdownTeam ralph=false still throws on failed tasks (normal path unchanged)', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-ralph-normal-'));
-    try {
-      await initTeamState('team-ralph-normal', 'normal gate test', 'executor', 1, cwd);
-      await createTask(
-        'team-ralph-normal',
+        'team-normal-gate',
         { subject: 'failed', description: 'd', status: 'failed' },
         cwd,
       );
 
       await assert.rejects(
-        () => shutdownTeam('team-ralph-normal', cwd),
+        () => shutdownTeam('team-normal-gate', cwd),
         /shutdown_gate_blocked:pending=0,blocked=0,in_progress=0,failed=1/,
       );
 
-      const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-ralph-normal');
+      const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-normal-gate');
       assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
 
   it('resumeTeam returns null for non-existent team', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-'));
@@ -3354,6 +3289,71 @@ esac
       assert.equal(messages[1]?.from_worker, 'worker-2');
       assert.equal(messages[0]?.to_worker, 'leader-fixed');
       assert.equal(messages[1]?.to_worker, 'leader-fixed');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('sendWorkerMessage dedupes identical undelivered leader-fixed messages', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-'));
+    try {
+      await initTeamState('team-leader-dedupe', 'leader mailbox dedupe test', 'executor', 1, cwd);
+      await sendWorkerMessage('team-leader-dedupe', 'worker-1', 'leader-fixed', 'INTEGRATED: same-body', cwd);
+      await sendWorkerMessage('team-leader-dedupe', 'worker-1', 'leader-fixed', 'INTEGRATED: same-body', cwd);
+
+      const messages = await listMailboxMessages('team-leader-dedupe', 'leader-fixed', cwd);
+      assert.equal(messages.length, 1);
+      assert.equal(messages[0]?.body, 'INTEGRATED: same-body');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it('sendWorkerMessage keeps hook-preferred duplicate leader mailbox sends idempotent after notification', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-leader-dedupe-notified-'));
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-leader-dedupe-notified-bin-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  send-keys)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        },
+        async () => {
+          await initTeamState('team-leader-dedupe-notified', 'leader mailbox dedupe notified test', 'executor', 1, cwd);
+          const cfg = await readTeamConfig('team-leader-dedupe-notified', cwd);
+          assert.ok(cfg);
+          if (!cfg) throw new Error('missing team config');
+          cfg.leader_pane_id = '%55';
+          await saveTeamConfig(cfg, cwd);
+
+          const manifestPath = teamStateTestPath(cwd, 'team', 'team-leader-dedupe-notified', 'manifest.v2.json');
+          const manifest = JSON.parse(await readFile(manifestPath, 'utf-8'));
+          manifest.policy = { ...(manifest.policy || {}), dispatch_ack_timeout_ms: 100 };
+          await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+
+          await sendWorkerMessage('team-leader-dedupe-notified', 'worker-1', 'leader-fixed', 'INTEGRATED: same-body', cwd);
+          await sendWorkerMessage('team-leader-dedupe-notified', 'worker-1', 'leader-fixed', 'INTEGRATED: same-body', cwd);
+
+          const messages = await listMailboxMessages('team-leader-dedupe-notified', 'leader-fixed', cwd);
+          const workerMessages = messages.filter((message) => message.from_worker === 'worker-1' && message.body === 'INTEGRATED: same-body');
+          assert.equal(workerMessages.length, 1);
+          assert.ok(workerMessages[0]?.notified_at);
+
+          const requests = await listDispatchRequests('team-leader-dedupe-notified', cwd, { kind: 'mailbox', to_worker: 'leader-fixed' });
+          assert.ok(requests.some((request) => request.status === 'notified' && request.message_id === workerMessages[0]?.message_id));
+        },
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
