@@ -7,7 +7,7 @@ import { readdir, readFile } from 'fs/promises';
 import { join } from 'path';
 import {
   codexHome, codexConfigPath, codexPromptsDir,
-  userSkillsDir, projectSkillsDir, omxStateDir,
+  userSkillsDir, projectSkillsDir, omxStateDir, detectLegacySkillRootOverlap,
 } from '../utils/paths.js';
 import { classifySpawnError, spawnPlatformCommandSync } from '../utils/platform-command.js';
 import { getCatalogExpectations } from './catalog-contract.js';
@@ -15,6 +15,7 @@ import { parse as parseToml } from '@iarna/toml';
 import { resolvePackagedExploreHarnessCommand, EXPLORE_BIN_ENV } from './explore.js';
 import { getPackageRoot } from '../utils/package.js';
 import { getDefaultBridge, isBridgeEnabled } from '../runtime/bridge.js';
+import { OMX_EXPLORE_CMD_ENV, isExploreCommandRoutingEnabled } from '../hooks/explore-routing.js';
 import { isLeaderRuntimeStale } from '../team/leader-activity.js';
 
 interface DoctorOptions {
@@ -129,11 +130,19 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
   // Check 4: Config file
   checks.push(await checkConfig(paths.configPath));
 
+  // Check 4.5: Explore routing default
+  checks.push(await checkExploreRouting(paths.configPath));
+
   // Check 5: Prompts installed
   checks.push(await checkPrompts(paths.promptsDir));
 
   // Check 6: Skills installed
   checks.push(await checkSkills(paths.skillsDir));
+
+  // Check 6.5: Legacy/current skill-root overlap
+  if (scopeResolution.scope === 'user') {
+    checks.push(await checkLegacySkillRootOverlap());
+  }
 
   // Check 7: AGENTS.md in project
   checks.push(checkAgentsMd(scopeResolution.scope, paths.codexHomeDir));
@@ -589,6 +598,59 @@ async function checkConfig(configPath: string): Promise<Check> {
   }
 }
 
+
+async function checkExploreRouting(configPath: string): Promise<Check> {
+  const envValue = process.env[OMX_EXPLORE_CMD_ENV];
+  if (typeof envValue === 'string' && !isExploreCommandRoutingEnabled(process.env)) {
+    return {
+      name: 'Explore routing',
+      status: 'warn',
+      message:
+        'disabled by environment override; enable with USE_OMX_EXPLORE_CMD=1 (or remove the explicit opt-out)',
+    };
+  }
+
+  if (!existsSync(configPath)) {
+    return {
+      name: 'Explore routing',
+      status: 'pass',
+      message: 'enabled by default (config.toml not found yet)',
+    };
+  }
+
+  try {
+    const content = await readFile(configPath, 'utf-8');
+    const parsed = parseToml(content) as { env?: Record<string, unknown> };
+    const configuredValue = parsed?.env?.USE_OMX_EXPLORE_CMD;
+
+    if (
+      typeof configuredValue === 'string' &&
+      !isExploreCommandRoutingEnabled({
+        USE_OMX_EXPLORE_CMD: configuredValue,
+      })
+    ) {
+      return {
+        name: 'Explore routing',
+        status: 'warn',
+        message:
+          'disabled in config.toml [env]; set USE_OMX_EXPLORE_CMD = "1" to restore default explore-first routing',
+      };
+    }
+
+    return {
+      name: 'Explore routing',
+      status: 'pass',
+      message: 'enabled by default',
+    };
+  } catch {
+    return {
+      name: 'Explore routing',
+      status: 'fail',
+      message: 'cannot read config.toml for explore routing check',
+    };
+  }
+}
+
 async function checkPrompts(dir: string): Promise<Check> {
   const expectations = getCatalogExpectations();
   if (!existsSync(dir)) {
@@ -604,6 +666,45 @@ async function checkPrompts(dir: string): Promise<Check> {
   } catch {
     return { name: 'Prompts', status: 'fail', message: 'cannot read prompts directory' };
   }
+}
+
+async function checkLegacySkillRootOverlap(): Promise<Check> {
+  const overlap = await detectLegacySkillRootOverlap();
+  if (!overlap.legacyExists) {
+    return {
+      name: 'Legacy skill roots',
+      status: 'pass',
+      message: 'no ~/.agents/skills overlap detected',
+    };
+  }
+
+  if (overlap.sameResolvedTarget) {
+    return {
+      name: 'Legacy skill roots',
+      status: 'pass',
+      message:
+        `~/.agents/skills links to canonical ${overlap.canonicalDir}; treating both paths as one shared skill root`,
+    };
+  }
+
+  if (overlap.overlappingSkillNames.length === 0) {
+    return {
+      name: 'Legacy skill roots',
+      status: 'warn',
+      message:
+        `legacy ~/.agents/skills still exists (${overlap.legacySkillCount} skills) alongside canonical ${overlap.canonicalDir}; remove or archive it if Codex shows duplicate entries`,
+    };
+  }
+
+  const mismatchMessage = overlap.mismatchedSkillNames.length > 0
+    ? `; ${overlap.mismatchedSkillNames.length} differ in SKILL.md content`
+    : '';
+  return {
+    name: 'Legacy skill roots',
+    status: 'warn',
+    message:
+      `${overlap.overlappingSkillNames.length} overlapping skill names between ${overlap.canonicalDir} and ${overlap.legacyDir}${mismatchMessage}; Codex Enable/Disable Skills may show duplicates until ~/.agents/skills is cleaned up`,
+  };
 }
 
 async function checkSkills(dir: string): Promise<Check> {

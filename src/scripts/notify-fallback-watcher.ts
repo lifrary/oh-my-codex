@@ -5,20 +5,26 @@ import { appendFile, mkdir, open, readFile, readdir, rename, stat, unlink, write
 import { spawnSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { homedir } from 'os';
+import { spawnPlatformCommandSync } from '../utils/platform-command.js';
 import { drainPendingTeamDispatch } from './notify-hook/team-dispatch.js';
 import {
   maybeAutoNudge,
-  resolveNudgePaneTarget,
+  isDeepInterviewInputLockActive,
   isDeepInterviewStateActive,
+  loadAutoNudgeConfig,
+  normalizeAutoNudgeSignatureText,
   resolveAutoNudgeSignature,
 } from './notify-hook/auto-nudge.js';
 import { checkPaneReadyForTeamSendKeys } from './notify-hook/team-tmux-guard.js';
 import {
+  checkWorkerPanesAlive,
   isLeaderStale,
   maybeNudgeTeamLeader,
   resolveLeaderStalenessThresholdMs,
 } from './notify-hook/team-leader-nudge.js';
 import { DEFAULT_MARKER } from './tmux-hook-engine.js';
+import { isTerminalPhase } from './notify-hook/utils.js';
+import { isSessionStale, readSessionState } from '../hooks/session.js';
 
 function argValue(name: string, fallback = ''): string {
   const idx = process.argv.indexOf(name);
@@ -33,6 +39,11 @@ function asNumber(value: string | number | undefined, fallback: number): number 
 
 function safeString(v: unknown): string {
   return typeof v === 'string' ? v : '';
+}
+
+function parsePositivePid(value: unknown): number | null {
+  const pid = Math.trunc(asNumber(value as string | number | undefined, 0));
+  return pid > 0 ? pid : null;
 }
 
 function parseIsoMillis(value: string | null | undefined): number | null {
@@ -66,6 +77,7 @@ async function waitForPidExit(pid: number, timeoutMs = 3000, stepMs = 50): Promi
 const cwd = resolve(argValue('--cwd', process.cwd()));
 const notifyScript = resolve(argValue('--notify-script', join(cwd, 'dist', 'scripts', 'notify-hook.js')));
 const runOnce = process.argv.includes('--once');
+const authorityOnly = process.argv.includes('--authority-only');
 // Keep fallback control-plane ticks comfortably below the default dispatch
 // ack budget so leaderless team dispatch + stale-alert recovery do not feel
 // laggy between native notify-hook turns.
@@ -158,6 +170,17 @@ interface ParentGuardState {
   reason: string;
   state_path: string;
   current_phase: string;
+  team_name?: string;
+  pane_count?: number;
+}
+
+interface ActiveTeamResult {
+  active: boolean;
+  reason: string;
+  path: string;
+  state: Record<string, unknown> | null;
+  team_name: string;
+  pane_count: number;
 }
 
 interface FallbackAutoNudgeState {
@@ -237,6 +260,21 @@ function eventLog(event: Record<string, unknown>): Promise<void> {
   return appendFile(logPath, `${JSON.stringify({ timestamp: new Date().toISOString(), ...event })}\n`).catch(() => {});
 }
 
+function shouldLogLeaderNudgeTick(reason: string): boolean {
+  return reason === 'leader_nudge_checked' || reason === 'leader_nudge_failed';
+}
+
+function shouldLogDispatchDrainTick(result: unknown): boolean {
+  if (!result || typeof result !== 'object') return false;
+  const record = result as Record<string, unknown>;
+  const processed = asNumber(record.processed as string | number | undefined, 0);
+  const skipped = asNumber(record.skipped as string | number | undefined, 0);
+  const failed = asNumber(record.failed as string | number | undefined, 0);
+  if (processed > 0 || skipped > 0 || failed > 0) return true;
+  const reason = safeString(record.reason).trim();
+  return reason !== '' && reason !== 'worker_context';
+}
+
 function normalizeRalphContinueSteerState(raw: Record<string, unknown> | null | undefined): RalphContinueSteerState {
   if (!raw || typeof raw !== 'object') return { ...lastRalphContinueSteer };
   return {
@@ -301,19 +339,28 @@ interface ActiveModeResult {
 
 async function resolveActiveModeState(mode: string): Promise<ActiveModeResult> {
   const candidateDirs: string[] = [];
-  const sessionPath = join(stateDir, 'session.json');
-  try {
-    const session = JSON.parse(await readFile(sessionPath, 'utf-8')) as Record<string, unknown>;
-    const sessionId = safeString(session?.session_id).trim();
-    if (sessionId) {
-      candidateDirs.push(join(stateDir, 'sessions', sessionId));
+  let currentSessionId = '';
+  let currentSessionIsLive = false;
+  const session = await readSessionState(cwd);
+  if (session?.session_id) {
+    currentSessionId = safeString(session.session_id).trim();
+    currentSessionIsLive = !isSessionStale(session);
+    if (currentSessionId && currentSessionIsLive) {
+      candidateDirs.push(join(stateDir, 'sessions', currentSessionId));
     }
-  } catch {
-    // No active session file; fall back to root state only.
   }
   if (!candidateDirs.includes(stateDir)) candidateDirs.push(stateDir);
 
   for (const dir of candidateDirs) {
+    if (mode === 'ralph' && dir === stateDir && currentSessionId) {
+      return {
+        active: false,
+        reason: currentSessionIsLive ? 'blocked_by_current_session' : 'stale_current_session',
+        path: '',
+        state: null,
+      };
+    }
+
     const path = join(dir, `${mode}-state.json`);
     if (!existsSync(path)) continue;
     const parsed = await readFile(path, 'utf-8')
@@ -348,19 +395,95 @@ async function resolveActiveRalphState(): Promise<ActiveModeResult> {
   return resolveActiveModeState('ralph');
 }
 
+async function resolveActiveTeamState(): Promise<ActiveTeamResult> {
+  const candidateDirs: string[] = [];
+  const sessionPath = join(stateDir, 'session.json');
+  try {
+    const session = JSON.parse(await readFile(sessionPath, 'utf-8')) as Record<string, unknown>;
+    const sessionId = safeString(session?.session_id).trim();
+    if (sessionId) {
+      candidateDirs.push(join(stateDir, 'sessions', sessionId));
+    }
+  } catch {
+    // No active session file; fall back to root state only.
+  }
+  if (!candidateDirs.includes(stateDir)) candidateDirs.push(stateDir);
+
+  for (const dir of candidateDirs) {
+    const path = join(dir, 'team-state.json');
+    if (!existsSync(path)) continue;
+    const parsed = await readFile(path, 'utf-8')
+      .then((content) => JSON.parse(content) as Record<string, unknown>)
+      .catch(() => null);
+    if (!parsed || typeof parsed !== 'object' || parsed.active !== true) continue;
+
+    const teamName = safeString(parsed.team_name).trim();
+    if (!teamName) continue;
+
+    const teamConfigDir = join(stateDir, 'team', teamName);
+    const phasePath = join(teamConfigDir, 'phase.json');
+    const phaseState = existsSync(phasePath)
+      ? await readFile(phasePath, 'utf-8')
+        .then((content) => JSON.parse(content) as Record<string, unknown>)
+        .catch(() => null)
+      : null;
+    const phase = safeString(phaseState?.current_phase).trim();
+    if (phase && isTerminalPhase(phase)) continue;
+
+    const manifestPath = join(teamConfigDir, 'manifest.v2.json');
+    const configPath = join(teamConfigDir, 'config.json');
+    const teamConfigPath = existsSync(manifestPath) ? manifestPath : configPath;
+    const teamConfig = existsSync(teamConfigPath)
+      ? await readFile(teamConfigPath, 'utf-8')
+        .then((content) => JSON.parse(content) as Record<string, unknown>)
+        .catch(() => null)
+      : null;
+    const tmuxSession = safeString(teamConfig?.tmux_session).trim();
+    if (!tmuxSession) continue;
+
+    const workers = Array.isArray(teamConfig?.workers) ? teamConfig.workers as Array<Record<string, unknown>> : [];
+    const workerPaneIds: string[] = workers
+      .map((worker) => safeString(worker?.pane_id).trim())
+      .filter(Boolean);
+    const paneStatus = await checkWorkerPanesAlive(tmuxSession, workerPaneIds as any);
+    if (!paneStatus.alive) continue;
+
+    return {
+      active: true,
+      reason: 'active',
+      path,
+      state: parsed,
+      team_name: teamName,
+      pane_count: paneStatus.paneCount,
+    };
+  }
+
+  return {
+    active: false,
+    reason: 'cleared',
+    path: '',
+    state: null,
+    team_name: '',
+    pane_count: 0,
+  };
+}
+
 async function emitRalphContinueSteer(paneId: string, message: string): Promise<void> {
   const markedText = `${message} ${DEFAULT_MARKER}`;
   await new Promise<void>((resolve) => {
-    const typed = spawnSync('tmux', ['send-keys', '-t', paneId, '-l', markedText], { encoding: 'utf-8' });
+    const { result: typed } = spawnPlatformCommandSync('tmux', ['send-keys', '-t', paneId, '-l', markedText], { encoding: 'utf-8' });
+    if (typed.error) throw new Error(typed.error.message);
     if (typed.status !== 0) throw new Error((typed.stderr || typed.stdout || '').trim() || 'tmux send-keys failed');
     setTimeout(resolve, 100);
   });
   await new Promise<void>((resolve) => {
-    const submitA = spawnSync('tmux', ['send-keys', '-t', paneId, 'C-m'], { encoding: 'utf-8' });
+    const { result: submitA } = spawnPlatformCommandSync('tmux', ['send-keys', '-t', paneId, 'C-m'], { encoding: 'utf-8' });
+    if (submitA.error) throw new Error(submitA.error.message);
     if (submitA.status !== 0) throw new Error((submitA.stderr || submitA.stdout || '').trim() || 'tmux send-keys C-m failed');
     setTimeout(resolve, 100);
   });
-  const submitB = spawnSync('tmux', ['send-keys', '-t', paneId, 'C-m'], { encoding: 'utf-8' });
+  const { result: submitB } = spawnPlatformCommandSync('tmux', ['send-keys', '-t', paneId, 'C-m'], { encoding: 'utf-8' });
+  if (submitB.error) throw new Error(submitB.error.message);
   if (submitB.status !== 0) {
     throw new Error((submitB.stderr || submitB.stdout || '').trim() || 'tmux send-keys C-m failed');
   }
@@ -384,9 +507,9 @@ async function readRalphSteerLock(path: string): Promise<RalphSteerLockRecord | 
   if (!raw.trim()) return null;
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const pid = Math.trunc(asNumber(parsed.pid as string | number | undefined, 0));
+    const pid = parsePositivePid(parsed.pid);
     const acquiredAt = safeString(parsed.acquired_at).trim();
-    if (!pid || !acquiredAt) return null;
+    if (pid === null || !acquiredAt) return null;
     return { pid, acquired_at: acquiredAt };
   } catch {
     return null;
@@ -433,6 +556,35 @@ async function withRalphSteerLock<T>(task: () => Promise<T>): Promise<T | null> 
   }
 }
 
+interface RalphProgressGateResult {
+  allow: boolean;
+  reason: string;
+  progress_at: string;
+}
+
+async function readRalphProgressGate(now: number): Promise<RalphProgressGateResult> {
+  const hudState = await readJsonObject(join(stateDir, 'hud-state.json'));
+  if (!hudState || typeof hudState !== 'object') {
+    return { allow: false, reason: 'progress_missing', progress_at: '' };
+  }
+
+  const progressAt = safeString(hudState.last_progress_at).trim();
+  if (!progressAt) {
+    return { allow: false, reason: 'progress_missing', progress_at: '' };
+  }
+
+  const progressMs = parseIsoMillis(progressAt);
+  if (progressMs === null) {
+    return { allow: false, reason: 'progress_invalid', progress_at: progressAt };
+  }
+
+  if (now - progressMs < RALPH_CONTINUE_CADENCE_MS) {
+    return { allow: false, reason: 'progress_fresh', progress_at: progressAt };
+  }
+
+  return { allow: true, reason: 'progress_stale', progress_at: progressAt };
+}
+
 function shouldSkipRalphContinue(now: number, candidateIso: string, startupIso: string): { skip: boolean; reason: string; anchorMs: number; anchorIso: string } {
   const sharedMs = parseIsoMillis(candidateIso);
   const localMs = parseIsoMillis(lastRalphContinueSteer.last_sent_at);
@@ -457,19 +609,19 @@ async function readPidFileRecord(path: string): Promise<PidFileRecord | null> {
   if (!trimmed) return null;
   try {
     const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-    const pid = Math.trunc(asNumber(parsed.pid as string | number | undefined, 0));
-    if (pid <= 0) return null;
+    const pid = parsePositivePid(parsed.pid);
+    if (pid === null) return null;
     return {
       pid,
-      parent_pid: Math.trunc(asNumber(parsed.parent_pid as string | number | undefined, 0)) || undefined,
+      parent_pid: parsePositivePid(parsed.parent_pid) ?? undefined,
       cwd: safeString(parsed.cwd) || undefined,
       started_at: safeString(parsed.started_at) || undefined,
       max_lifetime_ms: asNumber(parsed.max_lifetime_ms as string | number | undefined, 0) || undefined,
       owner_token: safeString(parsed.owner_token) || undefined,
     };
   } catch {
-    const pid = Number.parseInt(trimmed, 10);
-    return Number.isFinite(pid) && pid > 0 ? { pid } : null;
+    const pid = parsePositivePid(trimmed);
+    return pid === null ? null : { pid };
   }
 }
 
@@ -490,6 +642,7 @@ async function runRalphContinueSteerTick(): Promise<void> {
   const nowIso = new Date(now).toISOString();
   const startupIso = new Date(startedAt).toISOString();
   const activeRalph = await resolveActiveRalphState();
+  const activePaneId = safeString(activeRalph.state?.tmux_pane_id).trim();
   lastRalphContinueSteer = {
     ...lastRalphContinueSteer,
     active: activeRalph.active,
@@ -498,6 +651,7 @@ async function runRalphContinueSteerTick(): Promise<void> {
     last_reason: activeRalph.reason,
     last_error: null,
     state_path: activeRalph.path,
+    pane_id: activePaneId,
     pane_current_command: '',
     shared_timestamp_path: ralphSteerTimestampPath,
     singleton_lock_path: ralphSteerLockPath,
@@ -532,7 +686,13 @@ async function runRalphContinueSteerTick(): Promise<void> {
       return { sent: false, skipped: true };
     }
 
-    const paneId = safeString(activeRalph.state?.tmux_pane_id).trim() || await resolveNudgePaneTarget(stateDir);
+    const progressGate = await readRalphProgressGate(Date.now());
+    if (!progressGate.allow) {
+      lastRalphContinueSteer.last_reason = progressGate.reason;
+      return { sent: false, skipped: true };
+    }
+
+    const paneId = safeString(activeRalph.state?.tmux_pane_id).trim();
     if (!paneId) {
       lastRalphContinueSteer.last_reason = 'pane_missing';
       lastRalphContinueSteer.pane_id = '';
@@ -649,6 +809,7 @@ async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
     started_at: new Date(startedAt).toISOString(),
     cwd,
     notify_script: notifyScript,
+    authority_only: authorityOnly,
     poll_ms: pollMs,
     pid_file: runOnce ? null : pidFilePath,
     max_lifetime_ms: maxLifetimeMs,
@@ -746,14 +907,23 @@ async function runFallbackAutoNudgeTick(): Promise<void> {
     'input-messages': ['[notify-fallback] synthesized from stalled hud-state'],
     'last-assistant-message': lastMessage,
   }, lastMessage);
-  if (lastFallbackAutoNudge.last_nudged_signature === signature) {
-    lastFallbackAutoNudge.last_reason = 'duplicate_stall_signature';
+  const persistedAutoNudgeState = await readAutoNudgeState();
+  const autoNudgeConfig = await loadAutoNudgeConfig();
+  const semanticSignature = normalizeAutoNudgeSignatureText(lastMessage);
+  if (signature && safeString(persistedAutoNudgeState?.lastSignature) === signature) {
+    lastFallbackAutoNudge.last_reason = 'already_nudged_for_signature';
+    lastFallbackAutoNudge.last_nudged_signature = signature;
     return;
   }
-
-  const persistedAutoNudgeState = await readAutoNudgeState();
-  if (safeString(persistedAutoNudgeState?.lastSignature) === signature) {
-    lastFallbackAutoNudge.last_reason = 'already_nudged_for_signature';
+  const lastNudgeAtMs = parseIsoMillis(safeString(persistedAutoNudgeState?.lastNudgeAt));
+  if (
+    semanticSignature
+    && safeString(persistedAutoNudgeState?.lastSemanticSignature) === semanticSignature
+    && autoNudgeConfig.ttlMs > 0
+    && lastNudgeAtMs !== null
+    && (now - lastNudgeAtMs) < autoNudgeConfig.ttlMs
+  ) {
+    lastFallbackAutoNudge.last_reason = 'ttl_active';
     lastFallbackAutoNudge.last_nudged_signature = signature;
     return;
   }
@@ -825,6 +995,8 @@ async function enforceLifecycleGuards(): Promise<boolean> {
         lastParentGuard.reason !== nextParentGuard.reason
         || lastParentGuard.state_path !== nextParentGuard.state_path
         || lastParentGuard.current_phase !== nextParentGuard.current_phase
+        || lastParentGuard.team_name !== nextParentGuard.team_name
+        || lastParentGuard.pane_count !== nextParentGuard.pane_count
       ) {
         await eventLog({
           type: 'watcher_parent_guard',
@@ -836,6 +1008,37 @@ async function enforceLifecycleGuards(): Promise<boolean> {
       }
       return false;
     }
+
+    const activeTeam = await resolveActiveTeamState();
+    if (activeTeam.active) {
+      const currentPhase = safeString(activeTeam.state?.current_phase);
+      const nextParentGuard: ParentGuardState = {
+        reason: 'parent_gone_deferred_for_active_team',
+        state_path: activeTeam.path,
+        current_phase: currentPhase,
+        team_name: activeTeam.team_name,
+        pane_count: activeTeam.pane_count,
+      };
+      if (
+        lastParentGuard.reason !== nextParentGuard.reason
+        || lastParentGuard.state_path !== nextParentGuard.state_path
+        || lastParentGuard.current_phase !== nextParentGuard.current_phase
+        || lastParentGuard.team_name !== nextParentGuard.team_name
+        || lastParentGuard.pane_count !== nextParentGuard.pane_count
+      ) {
+        await eventLog({
+          type: 'watcher_parent_guard',
+          reason: nextParentGuard.reason,
+          state_path: nextParentGuard.state_path,
+          current_phase: currentPhase || null,
+          team_name: activeTeam.team_name,
+          pane_count: activeTeam.pane_count,
+        });
+        lastParentGuard = nextParentGuard;
+      }
+      return false;
+    }
+
     lastParentGuard = { reason: '', state_path: '', current_phase: '' };
     await requestShutdown('parent_gone');
     return true;
@@ -927,7 +1130,8 @@ async function invokeNotifyHook(payload: Record<string, unknown>, filePath: stri
   const result = spawnSync(process.execPath, [notifyScript, JSON.stringify(payload)], {
     cwd,
     encoding: 'utf-8',
-  });
+      windowsHide: true,
+    });
   const ok = result.status === 0;
   await eventLog({
     type: 'fallback_notify',
@@ -982,6 +1186,15 @@ async function ensureTrackedFiles(): Promise<void> {
   }
 }
 
+function splitBufferedLines(partial: string, delta: string): { lines: string[]; partial: string } {
+  const merged = partial + delta;
+  const lines = merged.split('\n');
+  return {
+    lines,
+    partial: lines.pop() || '',
+  };
+}
+
 async function pollFiles(): Promise<void> {
   for (const [path, meta] of fileState.entries()) {
     const currentSize = (await stat(path).catch(() => ({ size: 0 }))).size || 0;
@@ -990,9 +1203,9 @@ async function pollFiles(): Promise<void> {
     if (!content) continue;
     const delta = content.slice(meta.offset);
     meta.offset = currentSize;
-    const merged = meta.partial + delta;
-    const lines = merged.split('\n');
-    meta.partial = lines.pop() || '';
+    const buffered = splitBufferedLines(meta.partial, delta);
+    const lines = buffered.lines;
+    meta.partial = buffered.partial;
     for (const line of lines) {
       if (!line.trim()) continue;
       await processLine(meta, line, path);
@@ -1015,21 +1228,18 @@ async function runLeaderNudgeTick(): Promise<void> {
       last_tick_at: startedIso,
       last_error: 'worker_context',
     };
-    await eventLog({
-      type: 'leader_nudge_tick',
-      leader_only: false,
-      run_count: leaderNudgeRuns,
-      reason: 'worker_context',
-      stale_threshold_ms: staleThresholdMs,
-    });
     return;
   }
 
   try {
     const preComputedLeaderStale = await isLeaderStale(stateDir, staleThresholdMs, Date.now());
-    if (preComputedLeaderStale) {
-      await maybeNudgeTeamLeader({ cwd, stateDir, logsDir, preComputedLeaderStale });
-    }
+    await maybeNudgeTeamLeader({
+      cwd,
+      stateDir,
+      logsDir,
+      preComputedLeaderStale,
+      allowFreshMailboxNudges: false,
+    });
     leaderNudgeRuns += 1;
     lastLeaderNudge = {
       enabled: true,
@@ -1039,14 +1249,17 @@ async function runLeaderNudgeTick(): Promise<void> {
       last_tick_at: startedIso,
       last_error: null,
     };
-    await eventLog({
-      type: 'leader_nudge_tick',
-      leader_only: true,
-      run_count: leaderNudgeRuns,
-      stale_threshold_ms: staleThresholdMs,
-      precomputed_leader_stale: preComputedLeaderStale,
-      reason: preComputedLeaderStale ? 'leader_nudge_checked' : 'leader_nudge_skipped_not_stale',
-    });
+    const reason = preComputedLeaderStale ? 'leader_nudge_checked' : 'leader_nudge_skipped_not_stale';
+    if (shouldLogLeaderNudgeTick(reason)) {
+      await eventLog({
+        type: 'leader_nudge_tick',
+        leader_only: true,
+        run_count: leaderNudgeRuns,
+        stale_threshold_ms: staleThresholdMs,
+        precomputed_leader_stale: preComputedLeaderStale,
+        reason,
+      });
+    }
   } catch (err) {
     leaderNudgeRuns += 1;
     lastLeaderNudge = {
@@ -1079,13 +1292,15 @@ async function runDispatchDrainTick(): Promise<void> {
       last_result: result,
       last_error: null,
     };
-    await eventLog({
-      type: 'dispatch_drain_tick',
-      leader_only: lastDispatchDrain.leader_only,
-      dispatch_max_per_tick: dispatchTickMax,
-      run_count: dispatchDrainRuns,
-      ...(result && typeof result === 'object' ? result as Record<string, unknown> : {}),
-    });
+    if (shouldLogDispatchDrainTick(result)) {
+      await eventLog({
+        type: 'dispatch_drain_tick',
+        leader_only: lastDispatchDrain.leader_only,
+        dispatch_max_per_tick: dispatchTickMax,
+        run_count: dispatchDrainRuns,
+        ...(result && typeof result === 'object' ? result as Record<string, unknown> : {}),
+      });
+    }
   } catch (err) {
     dispatchDrainRuns += 1;
     lastDispatchDrain = {
@@ -1105,21 +1320,29 @@ async function runDispatchDrainTick(): Promise<void> {
   }
 }
 
+async function shouldSuppressInteractiveFallbackTicks(): Promise<boolean> {
+  const [deepInterviewStateActive, deepInterviewInputLockActive] = await Promise.all([
+    isDeepInterviewStateActive(stateDir),
+    isDeepInterviewInputLockActive(stateDir),
+  ]);
+  return deepInterviewStateActive || deepInterviewInputLockActive;
+}
+
 async function pumpTeamControlPlaneTick(): Promise<void> {
   await runDispatchDrainTick();
-  const deepInterviewStateActive = await isDeepInterviewStateActive(stateDir);
-  if (deepInterviewStateActive) return;
+  if (await shouldSuppressInteractiveFallbackTicks()) return;
   await runLeaderNudgeTick();
   await runFallbackAutoNudgeTick();
 }
 
 
 async function runWatcherCycle(): Promise<void> {
-  await ensureTrackedFiles();
-  await pollFiles();
+  if (!authorityOnly) {
+    await ensureTrackedFiles();
+    await pollFiles();
+  }
   await pumpTeamControlPlaneTick();
-  const deepInterviewStateActive = await isDeepInterviewStateActive(stateDir);
-  if (!deepInterviewStateActive) {
+  if (!authorityOnly && !(await shouldSuppressInteractiveFallbackTicks())) {
     await runRalphWatcherBehaviorTick();
   }
   await writeState();
@@ -1149,16 +1372,19 @@ async function main(): Promise<void> {
 
   await registerPidFile();
   await loadPersistedWatcherState();
-  await eventLog({
-    type: 'watcher_start',
-    cwd,
-    notify_script: notifyScript,
-    poll_ms: pollMs,
-    once: runOnce,
-    parent_pid: parentPid,
-    pid_file: runOnce ? null : pidFilePath,
-    max_lifetime_ms: maxLifetimeMs,
-  });
+  if (!(runOnce && authorityOnly)) {
+    await eventLog({
+      type: 'watcher_start',
+      cwd,
+      notify_script: notifyScript,
+      authority_only: authorityOnly,
+      poll_ms: pollMs,
+      once: runOnce,
+      parent_pid: parentPid,
+      pid_file: runOnce ? null : pidFilePath,
+      max_lifetime_ms: maxLifetimeMs,
+    });
+  }
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGHUP', () => shutdown('SIGHUP'));
@@ -1167,7 +1393,9 @@ async function main(): Promise<void> {
 
   if (runOnce) {
     await runWatcherCycle();
-    await eventLog({ type: 'watcher_once_complete', seen_turns: seenTurnKeys.size });
+    if (!authorityOnly) {
+      await eventLog({ type: 'watcher_once_complete', authority_only: authorityOnly, seen_turns: seenTurnKeys.size });
+    }
     process.exit(0);
   }
 

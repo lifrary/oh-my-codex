@@ -80,6 +80,10 @@ export function normalizeTmuxHookConfig(raw: any): any {
   };
 }
 
+export function tmuxHookExplicitlyDisablesInjection(raw: any): boolean {
+  return Boolean(raw && typeof raw === 'object' && raw.enabled === false);
+}
+
 export function pickActiveMode(activeModes: any, allowedModes: any): string | null {
   const activeSet = new Set((activeModes || []).filter((mode: any) => typeof mode === 'string'));
   for (const mode of allowedModes || []) {
@@ -223,6 +227,7 @@ export function resolveCodexPane(): string {
   try {
     const sessionName = execFileSync('tmux', ['display-message', '-t', envPane, '-p', '#S'], {
       encoding: 'utf-8', timeout: 2000,
+      windowsHide: true,
     }).trim();
     if (!sessionName) return '';
 
@@ -297,6 +302,17 @@ export function paneLooksReady(captured: any): boolean {
   return lines.some((line) => /^\s*(?:[›>❯]\s*)?[A-Z][A-Z0-9]+-\d+\s+only(?:\s*(?:…|\.{3}))?\s*$/iu.test(line));
 }
 
+export function paneShowsCodexViewport(captured: any): boolean {
+  const lines = normalizePaneLines(captured);
+  if (lines.length === 0) return false;
+  if (paneIsBootstrapping(lines)) return false;
+
+  const hasCodexBanner = lines.some((line) => /\bOpenAI Codex\b/i.test(line));
+  if (!hasCodexBanner) return false;
+
+  return lines.some((line) => /(?:^|\s)(?:model|directory):/i.test(line));
+}
+
 export function paneHasActiveTask(captured: any): boolean {
   const tail = normalizePaneLines(captured).map((line) => line.trim()).slice(-40);
   if (tail.some((line) => /\b\d+\s+background terminal running\b/i.test(line))) return true;
@@ -308,6 +324,10 @@ export function paneHasActiveTask(captured: any): boolean {
 
 export function buildCapturePaneArgv(paneTarget: any, tailLines = 80): string[] {
   return ['capture-pane', '-t', paneTarget, '-p', '-S', `-${tailLines}`];
+}
+
+export function buildVisibleCapturePaneArgv(paneTarget: any): string[] {
+  return ['capture-pane', '-t', paneTarget, '-p'];
 }
 
 export function buildSendKeysArgv({ paneTarget, prompt, dryRun, submitKeyPresses = 2 }: any): any {

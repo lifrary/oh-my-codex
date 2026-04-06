@@ -15,7 +15,9 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { writeSessionStart } from '../session.js';
 import { tmpdir } from 'node:os';
+import { buildTmuxSessionName } from '../../cli/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCRIPTS_DIR = join(__dirname, '..', '..', '..', 'dist', 'scripts');
@@ -69,12 +71,24 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$format" == "#S" ]]; then
-    echo "devsess"
+    echo "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
     exit 0
   fi
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
+  target=""
+  while (($#)); do
+    case "$1" in
+      -t) target="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  if [[ -n "$target" ]]; then
+    printf "%%99	node	codex --model gpt-5
+"
+    exit 0
+  fi
   echo "%1 12345"
   exit 0
 fi
@@ -93,6 +107,7 @@ function runNotifyHook(
     type: 'agent-turn-complete',
     'thread-id': 'thread-test',
     'turn-id': `turn-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    'session-id': 'sess-managed-regression',
     'input-messages': ['test'],
     'last-assistant-message': 'done',
     ...payloadOverrides,
@@ -105,6 +120,8 @@ function runNotifyHook(
       ...process.env,
       PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
       CODEX_HOME: codexHome,
+      OMX_SESSION_ID: 'sess-managed-regression',
+      OMX_TEST_TMUX_SESSION_NAME: buildTmuxSessionName(cwd, 'sess-managed-regression'),
       TMUX_PANE: '%99',
       TMUX: '1',
       OMX_TEAM_WORKER: '',
@@ -208,6 +225,7 @@ describe('regression-205: notify-hook records pending stall state on "if you wan
       await writeJson(join(codexHome, '.omx-config.json'), {
         autoNudge: { enabled: true, delaySec: 0 },
       });
+      await writeSessionStart(cwd, 'sess-managed-regression');
 
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);

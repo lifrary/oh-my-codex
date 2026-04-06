@@ -9,7 +9,7 @@
 [![npm version](https://img.shields.io/npm/v/oh-my-codex)](https://www.npmjs.com/package/oh-my-codex)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
-[![Discord](https://img.shields.io/discord/1466022107199574193?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/qRJw62Gvh7)
+[![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/PUwSMR9XNk)
 
 > **[Website](https://yeachan-heo.github.io/oh-my-codex-website/)** | **[Documentation](https://yeachan-heo.github.io/oh-my-codex-website/docs.html)** | **[CLI Reference](https://yeachan-heo.github.io/oh-my-codex-website/docs.html#cli-reference)** | **[Workflows](https://yeachan-heo.github.io/oh-my-codex-website/docs.html#workflows)** | **[OpenClaw 통합 가이드](./docs/openclaw-integration.ko.md)** | **[GitHub](https://github.com/Yeachan-Heo/oh-my-codex)** | **[npm](https://www.npmjs.com/package/oh-my-codex)**
 
@@ -31,10 +31,10 @@ Spark Initiative는 OMX의 네이티브 탐색/검사 경로를 강화한 릴리
 Codex 내부에서:
 
 ```text
-/prompts:architect "analyze current auth boundaries"
-/prompts:executor "implement input validation in login"
-$plan "ship OAuth callback safely"
-$team 3:executor "fix all TypeScript errors"
+$deep-interview "clarify the auth change"
+$ralplan "approve the auth plan and review tradeoffs"
+$ralph "carry the approved plan to completion"
+$team 3:executor "execute the approved plan in parallel"
 ```
 
 터미널에서:
@@ -44,6 +44,12 @@ omx team 4:executor "parallelize a multi-module refactor"
 omx team status <team-name>
 omx team shutdown <team-name>
 ```
+
+## 권장 워크플로
+
+1. `$deep-interview` — 범위나 경계가 아직 모호할 때 먼저 명확히 합니다.
+2. `$ralplan` — 정리된 범위를 승인 가능한 아키텍처 및 구현 계획으로 바꿉니다.
+3. `$team` 또는 `$ralph` — 승인된 계획을 병렬로 조율해 실행하려면 `$team`, 한 명의 책임자가 끝까지 밀고 검증하려면 `$ralph`를 사용합니다.
 
 ## 핵심 모델
 
@@ -156,7 +162,7 @@ omx team shutdown <team-name>
 ### Team shutdown policy
 
 Use `omx team shutdown <team-name>` after the team reaches a terminal state.
-Team cleanup now follows one standalone path; there is no separate `omx team ralph ...` shutdown policy anymore.
+Team cleanup now follows one standalone path; legacy linked-Ralph shutdown handling is no longer a separate public workflow.
 
 팀 워커를 위한 Worker CLI 선택:
 
@@ -200,7 +206,7 @@ OMX_TEAM_AUTO_INTERRUPT_RETRY=0  # 선택: 적응형 queue->resend 폴백 비활
 
 예시:
 - 에이전트: `architect`, `planner`, `executor`, `debugger`, `verifier`, `security-reviewer`
-- 스킬: `autopilot`, `plan`, `team`, `ralph`, `ultrawork`, `cancel`
+- 스킬: `deep-interview`, `ralplan`, `team`, `ralph`, `plan`, `cancel`
 
 ## 프로젝트 구조
 

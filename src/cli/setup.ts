@@ -24,11 +24,13 @@ import {
   codexAgentsDir,
   userSkillsDir,
   omxStateDir,
+  detectLegacySkillRootOverlap,
   omxPlansDir,
   omxLogsDir,
 } from "../utils/paths.js";
 import { buildMergedConfig, getRootModelName } from "../config/generator.js";
 import {
+  getLegacyUnifiedMcpRegistryCandidate,
   getUnifiedMcpRegistryCandidates,
   loadUnifiedMcpRegistry,
   planClaudeCodeMcpSettingsSync,
@@ -49,8 +51,10 @@ import {
   resolveAgentsModelTableContext,
   upsertAgentsModelTable,
 } from "../utils/agents-model-table.js";
+import { spawnPlatformCommandSync } from "../utils/platform-command.js";
 
 interface SetupOptions {
+  codexVersionProbe?: () => string | null;
   force?: boolean;
   dryRun?: boolean;
   scope?: SetupScope;
@@ -104,12 +108,22 @@ interface SetupBackupContext {
   baseRoot: string;
 }
 
+interface ManagedConfigResult {
+  finalConfig: string;
+  omxManagesTui: boolean;
+}
+
+interface LegacySkillOverlapNotice {
+  shouldWarn: boolean;
+  message: string;
+}
+
 export interface SkillFrontmatterMetadata {
   name: string;
   description: string;
 }
 
-const PROJECT_OMX_GITIGNORE_ENTRY = ".omx/";
+const PROJECT_GITIGNORE_ENTRIES = [".omx/", ".codex/"] as const;
 
 function applyScopePathRewritesToAgentsTemplate(
   content: string,
@@ -138,6 +152,7 @@ const DEFAULT_SETUP_SCOPE: SetupScope = "user";
 const LEGACY_SETUP_MODEL = "gpt-5.3-codex";
 const DEFAULT_SETUP_MODEL = DEFAULT_FRONTIER_MODEL;
 const OBSOLETE_NATIVE_AGENT_FIELD = ["skill", "ref"].join("_");
+const TUI_OWNED_BY_CODEX_VERSION = [0, 107, 0] as const;
 
 function createEmptyCategorySummary(): SetupCategorySummary {
   return {
@@ -306,6 +321,36 @@ export async function validateSkillFile(skillMdPath: string): Promise<void> {
   parseSkillFrontmatter(content, skillMdPath);
 }
 
+async function buildLegacySkillOverlapNotice(
+  scope: SetupScope,
+): Promise<LegacySkillOverlapNotice> {
+  if (scope !== "user") {
+    return { shouldWarn: false, message: "" };
+  }
+
+  const overlap = await detectLegacySkillRootOverlap();
+  if (!overlap.legacyExists) {
+    return { shouldWarn: false, message: "" };
+  }
+
+  if (overlap.overlappingSkillNames.length === 0) {
+    return {
+      shouldWarn: true,
+      message:
+        `Legacy ~/.agents/skills still exists (${overlap.legacySkillCount} skills) alongside canonical ${overlap.canonicalDir}. Codex may still discover both roots; archive or remove ~/.agents/skills if Enable/Disable Skills shows duplicates.`,
+    };
+  }
+
+  const mismatchSuffix = overlap.mismatchedSkillNames.length > 0
+    ? ` ${overlap.mismatchedSkillNames.length} overlapping skills have different SKILL.md content.`
+    : "";
+  return {
+    shouldWarn: true,
+    message:
+      `Detected ${overlap.overlappingSkillNames.length} overlapping skill names between canonical ${overlap.canonicalDir} and legacy ${overlap.legacyDir}.${mismatchSuffix} Remove or archive ~/.agents/skills after confirming ${overlap.canonicalDir} is the version you want Codex to load.`,
+  };
+}
+
 function logCategorySummary(name: string, summary: SetupCategorySummary): void {
   console.log(
     `  ${name}: updated=${summary.updated}, unchanged=${summary.unchanged}, ` +
@@ -425,6 +470,38 @@ async function promptForModelUpgrade(
   }
 }
 
+function parseSemverTriplet(version: string): [number, number, number] | null {
+  const match = version.match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function semverGte(
+  version: [number, number, number],
+  minimum: readonly [number, number, number],
+): boolean {
+  if (version[0] !== minimum[0]) return version[0] > minimum[0];
+  if (version[1] !== minimum[1]) return version[1] > minimum[1];
+  return version[2] >= minimum[2];
+}
+
+function probeInstalledCodexVersion(): string | null {
+  const { result } = spawnPlatformCommandSync("codex", ["--version"], {
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  if (result.error || result.status !== 0) return null;
+  const stdout = (result.stdout || "").trim();
+  return stdout === "" ? null : stdout;
+}
+
+function shouldOmxManageTuiFromCodexVersion(versionOutput: string | null): boolean {
+  if (!versionOutput) return true;
+  const parsed = parseSemverTriplet(versionOutput);
+  if (!parsed) return true;
+  return !semverGte(parsed, TUI_OWNED_BY_CODEX_VERSION);
+}
+
 async function promptForAgentsOverwrite(
   destinationPath: string,
 ): Promise<boolean> {
@@ -474,7 +551,7 @@ function hasGitignoreEntry(content: string, entry: string): boolean {
     .some((line) => line === entry);
 }
 
-async function ensureProjectOmxGitignore(
+async function ensureProjectGitignore(
   projectRoot: string,
   backupContext: SetupBackupContext,
   options: Pick<SetupOptions, "dryRun" | "verbose">,
@@ -485,13 +562,17 @@ async function ensureProjectOmxGitignore(
     ? await readFile(gitignorePath, "utf-8")
     : "";
 
-  if (hasGitignoreEntry(existing, PROJECT_OMX_GITIGNORE_ENTRY)) {
+  const missingEntries = PROJECT_GITIGNORE_ENTRIES.filter(
+    (entry) => !hasGitignoreEntry(existing, entry),
+  );
+
+  if (missingEntries.length === 0) {
     return "unchanged";
   }
 
   const nextContent = destinationExists
-    ? `${existing}${existing.endsWith("\n") || existing.length === 0 ? "" : "\n"}${PROJECT_OMX_GITIGNORE_ENTRY}\n`
-    : `${PROJECT_OMX_GITIGNORE_ENTRY}\n`;
+    ? `${existing}${existing.endsWith("\n") || existing.length === 0 ? "" : "\n"}${missingEntries.join("\n")}\n`
+    : `${PROJECT_GITIGNORE_ENTRIES.join("\n")}\n`;
 
   if (
     await ensureBackup(gitignorePath, destinationExists, backupContext, options)
@@ -505,7 +586,7 @@ async function ensureProjectOmxGitignore(
 
   if (options.verbose) {
     console.log(
-      `  ${options.dryRun ? "would update" : destinationExists ? "updated" : "created"} .gitignore (${PROJECT_OMX_GITIGNORE_ENTRY})`,
+      `  ${options.dryRun ? "would update" : destinationExists ? "updated" : "created"} .gitignore (${missingEntries.join(", ")})`,
     );
   }
 
@@ -574,18 +655,18 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
   console.log("  Done.\n");
 
   if (resolvedScope.scope === "project") {
-    const gitignoreResult = await ensureProjectOmxGitignore(
+    const gitignoreResult = await ensureProjectGitignore(
       projectRoot,
       backupContext,
       { dryRun, verbose },
     );
     if (gitignoreResult === "created") {
       console.log(
-        "  Created .gitignore with .omx/ so local OMX runtime state stays out of source control.\n",
+        "  Created .gitignore with .omx/ and .codex/ so local OMX runtime/config state stays out of source control.\n",
       );
     } else if (gitignoreResult === "updated") {
       console.log(
-        "  Added .omx/ to .gitignore so local OMX runtime state stays out of source control.\n",
+        "  Added .omx/ and/or .codex/ to .gitignore so local OMX runtime/config state stays out of source control.\n",
       );
     }
   }
@@ -674,18 +755,18 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
   console.log("[5/8] Updating config.toml...");
   const registryCandidates = getUnifiedMcpRegistryCandidates();
   const defaultRegistryCandidates = registryCandidates.slice(0, 1);
+  const legacyRegistryCandidate = getLegacyUnifiedMcpRegistryCandidate();
   const sharedMcpRegistry = await loadUnifiedMcpRegistry({
     candidates: options.mcpRegistryCandidates ?? defaultRegistryCandidates,
   });
   if (
     !options.mcpRegistryCandidates &&
     !sharedMcpRegistry.sourcePath &&
-    registryCandidates.length > 1 &&
-    existsSync(registryCandidates[1]) &&
-    !existsSync(registryCandidates[0])
+    existsSync(legacyRegistryCandidate) &&
+    !existsSync(defaultRegistryCandidates[0])
   ) {
     console.log(
-      `  warning: legacy shared MCP registry detected at ${registryCandidates[1]} but ignored by default; move it to ${registryCandidates[0]} if you still want setup to sync those servers`,
+      `  warning: legacy shared MCP registry detected at ${legacyRegistryCandidate} but ignored by default; move it to ${defaultRegistryCandidates[0]} if you still want setup to sync those servers`,
     );
   }
   if (verbose && sharedMcpRegistry.sourcePath) {
@@ -696,14 +777,15 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
   for (const warning of sharedMcpRegistry.warnings) {
     console.log(`  warning: ${warning}`);
   }
-  const resolvedConfig = await updateManagedConfig(
+  const managedConfig = await updateManagedConfig(
     scopeDirs.codexConfigFile,
     pkgRoot,
     sharedMcpRegistry,
     summary.config,
     backupContext,
-    { dryRun, verbose, modelUpgradePrompt },
+    { codexVersionProbe: options.codexVersionProbe, dryRun, verbose, modelUpgradePrompt },
   );
+  const resolvedConfig = managedConfig.finalConfig;
   if (resolvedScope.scope === "user") {
     await syncClaudeCodeMcpSettings(
       sharedMcpRegistry,
@@ -856,7 +938,11 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
   } else {
     console.log("  HUD config already exists (use --force to overwrite).");
   }
-  console.log("  StatusLine configured in config.toml via [tui] section.");
+  if (managedConfig.omxManagesTui) {
+    console.log("  StatusLine configured in config.toml via [tui] section.");
+  } else {
+    console.log("  Codex CLI >= 0.107.0 manages [tui]; OMX left that section untouched.");
+  }
   console.log();
 
   console.log("Setup refresh summary:");
@@ -866,6 +952,12 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
   logCategorySummary("agents_md", summary.agentsMd);
   logCategorySummary("config", summary.config);
   console.log();
+
+  const legacySkillOverlapNotice = await buildLegacySkillOverlapNotice(resolvedScope.scope);
+  if (legacySkillOverlapNotice.shouldWarn) {
+    console.log(`Migration hint: ${legacySkillOverlapNotice.message}`);
+    console.log();
+  }
 
   if (force) {
     console.log(
@@ -878,9 +970,9 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
   console.log("\nNext steps:");
   console.log("  1. Start Codex CLI in your project directory");
   console.log(
-    "  2. Use /prompts:architect, /prompts:executor, /prompts:planner as slash commands",
+    "  2. Use role/workflow keywords like $architect, $executor, and $plan in Codex",
   );
-  console.log("  3. Skills are available via /skills or implicit matching");
+  console.log("  3. Browse skills with /skills; AGENTS keyword routing can also activate them implicitly");
   console.log("  4. The AGENTS.md orchestration brain is loaded automatically");
   console.log(
     "  5. Native agent defaults configured in config.toml [agents] and TOML files written to .codex/agents/",
@@ -938,7 +1030,9 @@ async function cleanupLegacySkillPromptShims(
 }
 
 function isGitHubCliConfigured(): boolean {
-  const result = spawnSync("gh", ["auth", "status"], { stdio: "ignore" });
+  const result = spawnSync("gh", ["auth", "status"], { stdio: "ignore",
+      windowsHide: true,
+    });
   return result.status === 0;
 }
 
@@ -1402,13 +1496,19 @@ async function updateManagedConfig(
   sharedMcpRegistry: UnifiedMcpRegistryLoadResult,
   summary: SetupCategorySummary,
   backupContext: SetupBackupContext,
-  options: Pick<SetupOptions, "dryRun" | "verbose" | "modelUpgradePrompt">,
-): Promise<string> {
+  options: Pick<
+    SetupOptions,
+    "codexVersionProbe" | "dryRun" | "verbose" | "modelUpgradePrompt"
+  >,
+): Promise<ManagedConfigResult> {
   const existing = existsSync(configPath)
     ? await readFile(configPath, "utf-8")
     : "";
   const currentModel = getRootModelName(existing);
   let modelOverride: string | undefined;
+  const codexVersion =
+    options.codexVersionProbe?.() ?? probeInstalledCodexVersion();
+  const omxManagesTui = shouldOmxManageTuiFromCodexVersion(codexVersion);
 
   if (currentModel === LEGACY_SETUP_MODEL) {
     const shouldPrompt =
@@ -1425,6 +1525,7 @@ async function updateManagedConfig(
   }
 
   const finalConfig = buildMergedConfig(existing, pkgRoot, {
+    includeTui: omxManagesTui,
     modelOverride,
     sharedMcpServers: sharedMcpRegistry.servers,
     sharedMcpRegistrySource: sharedMcpRegistry.sourcePath,
@@ -1434,7 +1535,7 @@ async function updateManagedConfig(
 
   if (!changed) {
     summary.unchanged += 1;
-    return finalConfig;
+    return { finalConfig, omxManagesTui };
   }
 
   if (
@@ -1469,7 +1570,7 @@ async function updateManagedConfig(
       `  ${options.dryRun ? "would update" : "updated"} config ${configPath}`,
     );
   }
-  return finalConfig;
+  return { finalConfig, omxManagesTui };
 }
 
 function getClaudeCodeSettingsPath(homeDir = homedir()): string {

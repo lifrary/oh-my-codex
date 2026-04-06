@@ -67,6 +67,12 @@ function assertSingleOmxBlock(toml: string): void {
     1,
     "developer_instructions should appear once",
   );
+  assert.equal(count(toml, /^\[env\]$/gm), 1, "[env] should appear once");
+  assert.equal(
+    count(toml, /^USE_OMX_EXPLORE_CMD = "1"$/gm),
+    1,
+    "USE_OMX_EXPLORE_CMD should appear once",
+  );
 }
 
 describe("config generator idempotency (#384)", () => {
@@ -357,6 +363,35 @@ describe("config generator idempotency (#384)", () => {
     }
   });
 
+  it("skips emitting an OMX [tui] table when includeTui is disabled", () => {
+    const toml = buildMergedConfig("", "/tmp/omx", {
+      includeTui: false,
+    });
+
+    assert.doesNotMatch(toml, /^\[tui\]$/m);
+    assert.match(toml, /^\[mcp_servers\.omx_state\]$/m);
+    assert.match(toml, /^\[env\]$/m);
+    assert.match(toml, /^USE_OMX_EXPLORE_CMD = "1"$/m);
+  });
+
+  it('seeds USE_OMX_EXPLORE_CMD=1 into generated config by default', () => {
+    const toml = buildMergedConfig('', '/tmp/omx');
+
+    assert.match(toml, /^\[env\]$/m);
+    assert.match(toml, /^USE_OMX_EXPLORE_CMD = "1"$/m);
+  });
+
+  it('preserves existing [env] keys and explicit explore routing opt-outs', () => {
+    const toml = buildMergedConfig(
+      ['[env]', 'FOO = "bar"', 'USE_OMX_EXPLORE_CMD = "0"', ''].join('\n'),
+      '/tmp/omx',
+    );
+
+    assert.match(toml, /^\[env\]$/m);
+    assert.match(toml, /^FOO = "bar"$/m);
+    assert.match(toml, /^USE_OMX_EXPLORE_CMD = "0"$/m);
+  });
+
   it("replaces an existing OMX notify entry without leaving orphan fragments behind", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
     try {
@@ -627,7 +662,7 @@ describe("config generator idempotency (#384)", () => {
 
   it("skips shared MCP entries that already exist in user config", () => {
     const existing = [
-      "[mcp_servers.gitnexus]",
+      "[mcp_servers.existing_server]",
       'command = "custom"',
       'args = ["serve"]',
       "",
@@ -635,8 +670,8 @@ describe("config generator idempotency (#384)", () => {
     const merged = buildMergedConfig(existing, "/tmp/omx", {
       sharedMcpServers: [
         {
-          name: "gitnexus",
-          command: "gitnexus",
+          name: "existing_server",
+          command: "existing-server",
           args: ["mcp"],
           enabled: true,
         },
@@ -650,7 +685,7 @@ describe("config generator idempotency (#384)", () => {
       sharedMcpRegistrySource: "/tmp/.omx/mcp-registry.json",
     });
 
-    assert.equal(count(merged, /^\[mcp_servers\.gitnexus\]$/gm), 1);
+    assert.equal(count(merged, /^\[mcp_servers\.existing_server\]$/gm), 1);
     assert.match(merged, /command = "custom"/);
     assert.equal(count(merged, /^\[mcp_servers\.eslint\]$/gm), 1);
   });

@@ -9,7 +9,7 @@
 [![npm version](https://img.shields.io/npm/v/oh-my-codex)](https://www.npmjs.com/package/oh-my-codex)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
-[![Discord](https://img.shields.io/discord/1466022107199574193?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/qRJw62Gvh7)
+[![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/PUwSMR9XNk)
 
 **Website:** https://yeachan-heo.github.io/oh-my-codex-website/  
 **Docs:** [Getting Started](./docs/getting-started.html) · [Agents](./docs/agents.html) · [Skills](./docs/skills.html) · [Integrations](./docs/integrations.html) · [Demo](./DEMO.md) · [OpenClaw guide](./docs/openclaw-integration.md)
@@ -18,9 +18,32 @@ OMX is a workflow layer for [OpenAI Codex CLI](https://github.com/openai/codex).
 
 It keeps Codex as the execution engine and makes it easier to:
 - start a stronger Codex session by default
-- reuse good prompts with `/prompts:*`
-- invoke workflows with skills like `$plan`, `$ralph`, and `$team`
+- run one consistent workflow from clarification to completion
+- invoke the canonical skills with `$deep-interview`, `$ralplan`, `$team`, and `$ralph`
 - keep project guidance, plans, logs, and state in `.omx/`
+
+## Core Maintainers
+
+| Role | Name | GitHub |
+| --- | --- | --- |
+| Creator & Lead | Yeachan Heo | [@Yeachan-Heo](https://github.com/Yeachan-Heo) |
+| Maintainer | HaD0Yun | [@HaD0Yun](https://github.com/HaD0Yun) |
+
+## Ambassadors
+
+| Name | GitHub |
+| --- | --- |
+| Sigrid Jin | [@sigridjineth](https://github.com/sigridjineth) |
+
+## Top Collaborators
+
+| Name | GitHub |
+| --- | --- |
+| HaD0Yun | [@HaD0Yun](https://github.com/HaD0Yun) |
+| Junho Yeo | [@junhoyeo](https://github.com/junhoyeo) |
+| JiHongKim98 | [@JiHongKim98](https://github.com/JiHongKim98) |
+| Lor | — |
+| HyunjunJeon | [@HyunjunJeon](https://github.com/HyunjunJeon) |
 
 ## Recommended default flow
 
@@ -35,18 +58,20 @@ omx --madmax --high
 Then work normally inside Codex:
 
 ```text
-/prompts:architect "analyze the authentication flow"
-$plan "ship this feature cleanly"
+$deep-interview "clarify the authentication change"
+$ralplan "approve the auth plan and review tradeoffs"
+$ralph "carry the approved plan to completion"
+$team 3:executor "execute the approved plan in parallel"
 ```
 
 That is the main path.
-Start OMX strongly, do the work in Codex, and let the agent pull in `$team` or other workflows only when the task actually needs them.
+Start OMX strongly, clarify first when needed, approve the plan, then choose `$team` for coordinated parallel execution or `$ralph` for the persistent completion loop.
 
 ## What OMX is for
 
 Use OMX if you already like Codex and want a better day-to-day runtime around it:
-- reusable role prompts such as `/prompts:architect` and `/prompts:executor`
-- reusable workflows such as `$plan`, `$ralph`, `$team`, and `$deep-interview`
+- a standard workflow built around `$deep-interview`, `$ralplan`, `$team`, and `$ralph`
+- specialist roles and supporting skills when the task needs them
 - project guidance through scoped `AGENTS.md`
 - durable state under `.omx/` for plans, logs, memory, and mode tracking
 
@@ -70,14 +95,16 @@ Launch OMX the recommended way:
 omx --madmax --high
 ```
 
-Then try one prompt and one skill:
+Then try the canonical workflow:
 
 ```text
-/prompts:architect "analyze the authentication flow"
-$plan "map the safest implementation path"
+$deep-interview "clarify the authentication change"
+$ralplan "approve the safest implementation path"
+$ralph "carry the approved plan to completion"
+$team 3:executor "execute the approved plan in parallel"
 ```
 
-If the task grows, the agent can escalate to heavier workflows such as `$ralph` for persistent execution or `$team` for coordinated parallel work.
+Use `$team` when the approved plan needs coordinated parallel work, or `$ralph` when one persistent owner should keep pushing to completion.
 
 ## A simple mental model
 
@@ -85,30 +112,35 @@ OMX does **not** replace Codex.
 
 It adds a better working layer around it:
 - **Codex** does the actual agent work
-- **OMX prompts** make useful roles reusable
+- **OMX role keywords** make useful roles reusable
 - **OMX skills** make common workflows reusable
 - **`.omx/`** stores plans, logs, memory, and runtime state
 
-Most users should think of OMX as **better prompting + better workflow + better runtime**, not as a command surface to operate manually all day.
+Most users should think of OMX as **better task routing + better workflow + better runtime**, not as a command surface to operate manually all day.
 
 ## Start here if you are new
 
 1. Run `omx setup`
 2. Launch with `omx --madmax --high`
-3. Ask for analysis with `/prompts:architect "..."`
-4. Ask for planning with `$plan "..."`
-5. Let the agent decide when `$ralph`, `$team`, or another workflow is worth using
+3. Use `$deep-interview "..."` when the request or boundaries are still unclear
+4. Use `$ralplan "..."` to approve the plan and review tradeoffs
+5. Choose `$team` for coordinated parallel execution or `$ralph` for persistent completion loops
+
+## Recommended workflow
+
+1. `$deep-interview` — clarify scope when the request or boundaries are still vague.
+2. `$ralplan` — turn that clarified scope into an approved architecture and implementation plan.
+3. `$team` or `$ralph` — use `$team` for coordinated parallel execution, or `$ralph` when you want a persistent completion loop with one owner.
 
 ## Common in-session surfaces
 
 | Surface | Use it for |
 | --- | --- |
-| `/prompts:architect "..."` | analysis, boundaries, tradeoffs |
-| `/prompts:executor "..."` | focused implementation work |
-| `/skills` | browsing installed skills |
-| `$plan "..."` | planning before implementation |
-| `$ralph "..."` | persistent sequential execution |
-| `$team "..."` | coordinated parallel execution when the task is big enough |
+| `$deep-interview "..."` | clarifying intent, boundaries, and non-goals |
+| `$ralplan "..."` | approving the implementation plan and tradeoffs |
+| `$ralph "..."` | persistent completion and verification loops |
+| `$team "..."` | coordinated parallel execution when the work is big enough |
+| `/skills` | browsing installed skills and supporting helpers |
 
 ## Advanced / operator surfaces
 
@@ -158,6 +190,17 @@ omx sparkshell --tmux-pane %12 --tail-lines 400
 | Windows | `winget install psmux` |
 | Windows (WSL2) | `sudo apt install tmux` |
 
+## Known issues
+
+### Intel Mac: high `syspolicyd` / `trustd` CPU during startup
+
+On some Intel Macs, OMX startup — especially with `--madmax --high` — can spike `syspolicyd` / `trustd` CPU usage while macOS Gatekeeper validates many concurrent process launches.
+
+If this happens, try:
+- `xattr -dr com.apple.quarantine $(which omx)`
+- adding your terminal app to the Developer Tools allowlist in macOS Security settings
+- using lower concurrency (for example, avoid `--madmax --high`)
+
 ## Documentation
 
 - [Getting Started](./docs/getting-started.html)
@@ -184,6 +227,19 @@ omx sparkshell --tmux-pane %12 --tail-lines 400
 - [Deutsch](./README.de.md)
 - [Français](./README.fr.md)
 - [Italiano](./README.it.md)
+- [Ελληνικά](./README.el.md)
+- [Polski](./README.pl.md)
+
+## Contributors
+
+| Role | Name | GitHub |
+| --- | --- | --- |
+| Creator & Lead | Yeachan Heo | [@Yeachan-Heo](https://github.com/Yeachan-Heo) |
+| Maintainer | HaD0Yun | [@HaD0Yun](https://github.com/HaD0Yun) |
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Yeachan-Heo/oh-my-codex&type=date&legend=top-left)](https://www.star-history.com/#Yeachan-Heo/oh-my-codex&type=date&legend=top-left)
 
 ## License
 

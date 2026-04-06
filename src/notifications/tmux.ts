@@ -5,6 +5,7 @@
  */
 
 import { execFileSync, execSync } from "child_process";
+import { buildCapturePaneArgv } from "./tmux-detector.js";
 
 const TMUX_PANE_TARGET_RE = /^%\d+$/;
 const DEFAULT_CAPTURE_LINES = 12;
@@ -33,7 +34,8 @@ export function getCurrentTmuxSession(): string | null {
         encoding: "utf-8",
         timeout: 3000,
         stdio: ["pipe", "pipe", "pipe"],
-      }).trim();
+      windowsHide: true,
+    }).trim();
       if (sessionName) return sessionName;
     } catch {
       // fall through to PID-based detection
@@ -93,7 +95,8 @@ function detectTmuxSessionByPid(): string | null {
           encoding: "utf-8",
           timeout: 1000,
           stdio: ["pipe", "pipe", "pipe"],
-        }).trim();
+      windowsHide: true,
+    }).trim();
         const ppid = parseInt(ppidStr, 10);
         if (isNaN(ppid) || ppid <= 1) break;
         currentPid = ppid;
@@ -146,10 +149,11 @@ export function captureTmuxPane(paneId?: string | null, lines: number = 12): str
   const clampedLines = Math.max(1, Math.min(MAX_CAPTURE_LINES, safeLines));
 
   try {
-    const output = execFileSync("tmux", ["capture-pane", "-t", target, "-p", "-S", `-${clampedLines}`], {
+    const output = execFileSync("tmux", buildCapturePaneArgv(target, clampedLines), {
       encoding: "utf-8",
       timeout: 3000,
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     }).trim();
     return output || null;
   } catch {
@@ -239,7 +243,8 @@ function detectTmuxPaneByPid(): string | null {
           encoding: "utf-8",
           timeout: 1000,
           stdio: ["pipe", "pipe", "pipe"],
-        }).trim();
+      windowsHide: true,
+    }).trim();
         const ppid = parseInt(ppidStr, 10);
         if (isNaN(ppid) || ppid <= 1) break;
         currentPid = ppid;

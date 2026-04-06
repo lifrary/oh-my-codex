@@ -391,14 +391,7 @@ function teamStateExists(teamName: string, candidateCwd: string): boolean {
   return existsSync(join(teamRoot, 'config.json')) || existsSync(join(teamRoot, 'tasks')) || existsSync(teamRoot);
 }
 
-function parseTeamWorkerEnv(raw: string | undefined): { teamName: string; workerName: string } | null {
-  if (typeof raw !== 'string' || raw.trim() === '') return null;
-  const match = /^([a-z0-9][a-z0-9-]{0,29})\/(worker-\d+)$/.exec(raw.trim());
-  if (!match) return null;
-  return { teamName: match[1], workerName: match[2] };
-}
-
-function readTeamStateRootFromFile(path: string): string | null {
+function readTeamStateRootFromManifest(path: string): string | null {
   if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as { team_state_root?: unknown };
@@ -415,26 +408,14 @@ function stateRootToWorkingDirectory(stateRoot: string): string {
   return dirname(dirname(absolute));
 }
 
-function resolveTeamWorkingDirectoryFromMetadata(
-  teamName: string,
-  candidateCwd: string,
-  workerContext: { teamName: string; workerName: string } | null,
-): string | null {
+function resolveTeamWorkingDirectoryFromMetadata(teamName: string, candidateCwd: string): string | null {
   const teamRoot = join(candidateCwd, '.omx', 'state', 'team', teamName);
   if (!existsSync(teamRoot)) return null;
 
-  if (workerContext?.teamName === teamName) {
-    const workerRoot = readTeamStateRootFromFile(join(teamRoot, 'workers', workerContext.workerName, 'identity.json'));
-    if (workerRoot) return stateRootToWorkingDirectory(workerRoot);
-  }
+  const fromManifest = readTeamStateRootFromManifest(join(teamRoot, 'manifest.v2.json'));
+  if (!fromManifest) return null;
 
-  const fromManifest = readTeamStateRootFromFile(join(teamRoot, 'manifest.v2.json'));
-  if (fromManifest) return stateRootToWorkingDirectory(fromManifest);
-
-  const fromConfig = readTeamStateRootFromFile(join(teamRoot, 'config.json'));
-  if (fromConfig) return stateRootToWorkingDirectory(fromConfig);
-
-  return null;
+  return stateRootToWorkingDirectory(fromManifest);
 }
 
 function resolveTeamWorkingDirectory(teamName: string, preferredCwd: string): string {
@@ -451,12 +432,11 @@ function resolveTeamWorkingDirectory(teamName: string, preferredCwd: string): st
     if (!seeds.includes(seed)) seeds.push(seed);
   }
 
-  const workerContext = parseTeamWorkerEnv(process.env.OMX_TEAM_WORKER);
   for (const seed of seeds) {
     let cursor = seed;
     while (cursor) {
       if (teamStateExists(normalizedTeamName, cursor)) {
-        return resolveTeamWorkingDirectoryFromMetadata(normalizedTeamName, cursor, workerContext) ?? cursor;
+        return resolveTeamWorkingDirectoryFromMetadata(normalizedTeamName, cursor) ?? cursor;
       }
       const parent = dirname(cursor);
       if (!parent || parent === cursor) break;
@@ -464,6 +444,31 @@ function resolveTeamWorkingDirectory(teamName: string, preferredCwd: string): st
     }
   }
   return preferredCwd;
+}
+
+function readLegacyMailboxMessages(
+  teamName: string,
+  workerName: string,
+  cwd: string,
+): Array<Record<string, unknown>> {
+  const mailboxPath = join(cwd, '.omx', 'state', 'team', teamName, 'mailbox', `${workerName}.json`);
+  if (!existsSync(mailboxPath)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(mailboxPath, 'utf8')) as { messages?: Array<Record<string, unknown>> };
+    return Array.isArray(parsed.messages) ? parsed.messages : [];
+  } catch {
+    return [];
+  }
+}
+
+function readLegacyMailboxMessage(
+  teamName: string,
+  workerName: string,
+  messageId: string,
+  cwd: string,
+): Record<string, unknown> | null {
+  return readLegacyMailboxMessages(teamName, workerName, cwd)
+    .find((message) => String(message.message_id || '') === messageId) ?? null;
 }
 
 function normalizeTeamName(toolOrOperationName: string): string {
@@ -553,10 +558,7 @@ export async function executeTeamApiOperation(
         const beforeIds = new Set(beforeMessages.map((message) => message.message_id));
 
         const outcome = hasLiveTmuxTarget
-          ? (await (async () => {
-            await sendWorkerMessage(teamName, fromWorker, toWorker, body, cwd);
-            return { ok: true, transport: 'hook', reason: 'api_send_message_via_runtime', message_id: '' };
-          })())
+          ? await sendWorkerMessage(teamName, fromWorker, toWorker, body, cwd)
           : await queueDirectMailboxMessage({
             teamName,
             fromWorker,
@@ -574,11 +576,29 @@ export async function executeTeamApiOperation(
         const messages = await listMailboxMessages(teamName, toWorker, cwd);
         const matching = outcome.message_id
           ? messages.find((message) => message.message_id === outcome.message_id)
-          : [...messages].reverse().find((message) => !beforeIds.has(message.message_id) && message.from_worker === fromWorker && message.body === body);
-        if (!matching) {
+          : [...messages].reverse().find((message) =>
+            !beforeIds.has(message.message_id)
+            && message.from_worker === fromWorker
+            && message.to_worker === toWorker,
+          );
+        const legacyMatching = !matching && outcome.message_id
+          ? readLegacyMailboxMessage(teamName, toWorker, outcome.message_id, cwd)
+          : null;
+        const legacySenderFallback = !matching && !legacyMatching
+          ? [...readLegacyMailboxMessages(teamName, toWorker, cwd)].reverse().find((message) =>
+            !beforeIds.has(String(message.message_id || ''))
+            && String(message.from_worker || '') === fromWorker
+            && String(message.to_worker || '') === toWorker,
+          ) ?? null
+          : null;
+        const persisted = matching ?? legacyMatching ?? legacySenderFallback;
+        if (!persisted) {
           throw new Error(`send-message could not locate persisted mailbox message for ${fromWorker} -> ${toWorker}`);
         }
-        return { ok: true, operation, data: { message: matching, dispatch: outcome } };
+        const message = persisted.body || !body
+          ? persisted
+          : { ...persisted, body };
+        return { ok: true, operation, data: { message, dispatch: outcome } };
       }
       case 'broadcast': {
         const teamName = String(args.team_name || '').trim();

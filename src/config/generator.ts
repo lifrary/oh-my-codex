@@ -7,7 +7,7 @@
  * [table] header.  This generator therefore splits its output into:
  *   1. Top-level keys  (notify, model_reasoning_effort, developer_instructions)
  *   2. [features] flags
- *   3. [table] sections (mcp_servers, tui)
+ *   3. [table] sections (env, mcp_servers, tui)
  */
 
 import { readFile, writeFile } from "fs/promises";
@@ -18,6 +18,7 @@ import { DEFAULT_FRONTIER_MODEL } from "./models.js";
 import type { UnifiedMcpRegistryServer } from "./mcp-registry.js";
 
 interface MergeOptions {
+  includeTui?: boolean;
   modelOverride?: string;
   sharedMcpServers?: UnifiedMcpRegistryServer[];
   sharedMcpRegistrySource?: string;
@@ -47,6 +48,8 @@ const SHARED_MCP_REGISTRY_END_MARKER =
   "# End oh-my-codex shared MCP registry sync";
 const OMX_AGENTS_MAX_THREADS = 6;
 const OMX_AGENTS_MAX_DEPTH = 2;
+const OMX_EXPLORE_ROUTING_DEFAULT = '1';
+const OMX_EXPLORE_CMD_ENV = 'USE_OMX_EXPLORE_CMD';
 const OMX_TUI_STATUS_LINE =
   'status_line = ["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"]';
 
@@ -83,7 +86,7 @@ function getOmxTopLevelLines(
     "# oh-my-codex top-level settings (must be before any [table])",
     `notify = ["node", "${escapedPath}"]`,
     'model_reasoning_effort = "high"',
-    `developer_instructions = "You have oh-my-codex installed. AGENTS.md is your orchestration brain and the main orchestration surface. Use /prompts:<role> and spawned role prompts for specialized subagent work. Codex native subagents are available via .codex/agents and may be used for independent parallel subtasks within a single session or team pane. Skills are loaded from installed SKILL.md files under .codex/skills, not from native agent TOMLs. Use workflow skills via $name when explicitly invoked or clearly routed by AGENTS.md. Treat role prompts as narrower execution surfaces under AGENTS.md authority."`,
+    `developer_instructions = "You have oh-my-codex installed. AGENTS.md is your orchestration brain and the main orchestration surface. Use skill/keyword routing like $name plus spawned role-specialized subagents for specialized work. Codex native subagents are available via .codex/agents and may be used for independent parallel subtasks within a single session or team pane. Skills are loaded from installed SKILL.md files under .codex/skills, not from native agent TOMLs. Use workflow skills via $name when explicitly invoked or clearly routed by AGENTS.md. Treat installed prompts as narrower internal execution surfaces under AGENTS.md authority, even when user-facing docs prefer $name keywords."`,
   ];
 
   const existingModel = rootValues.get("model");
@@ -228,6 +231,48 @@ function upsertFeatureFlags(config: string): string {
   return lines.join("\n");
 }
 
+function upsertEnvSettings(config: string): string {
+  const lines = config.split(/\r?\n/);
+  const envStart = lines.findIndex((line) => /^\s*\[env\]\s*$/.test(line));
+
+  if (envStart < 0) {
+    const base = config.trimEnd();
+    const envBlock = [
+      "[env]",
+      `${OMX_EXPLORE_CMD_ENV} = "${OMX_EXPLORE_ROUTING_DEFAULT}"`,
+      "",
+    ].join("\n");
+    if (base.length === 0) return envBlock;
+    return `${base}\n\n${envBlock}`;
+  }
+
+  let sectionEnd = lines.length;
+  for (let i = envStart + 1; i < lines.length; i++) {
+    if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(lines[i])) {
+      sectionEnd = i;
+      break;
+    }
+  }
+
+  let exploreRoutingIdx = -1;
+  for (let i = envStart + 1; i < sectionEnd; i++) {
+    if (new RegExp(`^\\s*${OMX_EXPLORE_CMD_ENV}\\s*=`).test(lines[i])) {
+      exploreRoutingIdx = i;
+      break;
+    }
+  }
+
+  if (exploreRoutingIdx < 0) {
+    lines.splice(
+      sectionEnd,
+      0,
+      `${OMX_EXPLORE_CMD_ENV} = "${OMX_EXPLORE_ROUTING_DEFAULT}"`,
+    );
+  }
+
+  return lines.join("\n");
+}
+
 function upsertAgentsSettings(config: string): string {
   const lines = config.split(/\r?\n/);
   const agentsStart = lines.findIndex((line) =>
@@ -322,6 +367,49 @@ export function stripOmxFeatureFlags(config: string): string {
     const sectionContent = filtered.slice(newFeaturesStart + 1, newSectionEnd);
     if (sectionContent.every((l) => l.trim() === "")) {
       filtered.splice(newFeaturesStart, newSectionEnd - newFeaturesStart);
+    }
+  }
+
+  return filtered.join("\n");
+}
+
+export function stripOmxEnvSettings(config: string): string {
+  const lines = config.split(/\r?\n/);
+  const envStart = lines.findIndex((line) => /^\s*\[env\]\s*$/.test(line));
+
+  if (envStart < 0) return config;
+
+  let sectionEnd = lines.length;
+  for (let i = envStart + 1; i < lines.length; i++) {
+    if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(lines[i])) {
+      sectionEnd = i;
+      break;
+    }
+  }
+
+  const filtered: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (i > envStart && i < sectionEnd) {
+      const isOmxEnvKey = new RegExp(
+        `^\\s*${OMX_EXPLORE_CMD_ENV}\\s*=`,
+      ).test(lines[i]);
+      if (isOmxEnvKey) continue;
+    }
+    filtered.push(lines[i]);
+  }
+
+  const newEnvStart = filtered.findIndex((line) => /^\s*\[env\]\s*$/.test(line));
+  if (newEnvStart >= 0) {
+    let newSectionEnd = filtered.length;
+    for (let i = newEnvStart + 1; i < filtered.length; i++) {
+      if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(filtered[i])) {
+        newSectionEnd = i;
+        break;
+      }
+    }
+    const envContent = filtered.slice(newEnvStart + 1, newSectionEnd);
+    if (envContent.every((line) => line.trim() === "")) {
+      filtered.splice(newEnvStart, newSectionEnd - newEnvStart);
     }
   }
 
@@ -704,8 +792,9 @@ function getOmxTablesBlock(pkgRoot: string, includeTui = true): string {
  * Layout:
  *   1. OMX top-level keys (notify, model_reasoning_effort, developer_instructions)
  *   2. [features] with multi_agent + child_agents_md
- *   3. … user sections …
- *   4. OMX [table] sections (mcp_servers, tui)
+ *   3. [env] with defaulted explore-routing opt-in
+ *   4. … user sections …
+ *   5. OMX [table] sections (mcp_servers, tui)
  */
 export function buildMergedConfig(
   existingConfig: string,
@@ -713,6 +802,7 @@ export function buildMergedConfig(
   options: MergeOptions = {},
 ): string {
   let existing = existingConfig;
+  const includeTui = options.includeTui !== false;
 
   if (existing.includes("oh-my-codex (OMX) Configuration")) {
     const stripped = stripExistingOmxBlocks(existing);
@@ -730,8 +820,11 @@ export function buildMergedConfig(
   }
   existing = stripOrphanedOmxSections(existing);
   existing = upsertFeatureFlags(existing);
+  existing = upsertEnvSettings(existing);
   existing = upsertAgentsSettings(existing);
-  const tuiUpsert = upsertTuiStatusLine(existing);
+  const tuiUpsert = includeTui
+    ? upsertTuiStatusLine(existing)
+    : { cleaned: existing, hadExistingTui: false };
   existing = tuiUpsert.cleaned;
 
   const topLines = getOmxTopLevelLines(
@@ -739,7 +832,10 @@ export function buildMergedConfig(
     existing,
     options.modelOverride,
   );
-  const tablesBlock = getOmxTablesBlock(pkgRoot, !tuiUpsert.hadExistingTui);
+  const tablesBlock = getOmxTablesBlock(
+    pkgRoot,
+    includeTui && !tuiUpsert.hadExistingTui,
+  );
   const sharedRegistryBlock = getSharedMcpRegistryBlock(
     options.sharedMcpServers ?? [],
     options.sharedMcpRegistrySource,

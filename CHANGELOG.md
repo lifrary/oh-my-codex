@@ -4,6 +4,100 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.11.13] - 2026-04-04
+
+Patch release for team/runtime delivery integrity, busy-leader nudge handling, release hygiene fixes, and Windows/worktree reliability follow-through after `0.11.12`.
+
+### Fixed
+- **Leader + mailbox delivery integrity** — team leader mailbox delivery stays reliable across runtime/CLI seams, false team-coordination signals are suppressed during runtime handoff, and busy Codex leader panes can now receive queued nudges instead of silently deferring them. (PRs [#1217](https://github.com/Yeachan-Heo/oh-my-codex/pull/1217), [#1223](https://github.com/Yeachan-Heo/oh-my-codex/pull/1223), [#1224](https://github.com/Yeachan-Heo/oh-my-codex/pull/1224))
+- **Windows / tmux worktree supervision** — leader activity polling, HUD targeting, and Windows worktree/session handling stay stable across detached launches and worktree checkouts. (PRs [#1212](https://github.com/Yeachan-Heo/oh-my-codex/pull/1212), [#1213](https://github.com/Yeachan-Heo/oh-my-codex/pull/1213), [#1191](https://github.com/Yeachan-Heo/oh-my-codex/pull/1191))
+- **Workflow hygiene around deep-interview + uninstall paths** — fallback nudges honor active deep-interview input locks, uninstall warns cleanly about legacy skills, and shutdown cleanup reaps detached worker descendants more reliably. (PRs [#1203](https://github.com/Yeachan-Heo/oh-my-codex/pull/1203), [#1193](https://github.com/Yeachan-Heo/oh-my-codex/pull/1193), [#1204](https://github.com/Yeachan-Heo/oh-my-codex/pull/1204))
+
+### Changed
+- **Release metadata sync** — Node/Cargo package metadata, lockfiles, changelog, release notes, and release body are aligned to `0.11.13`.
+- **Release branch repair** — the accidental placeholder corruption in `src/hooks/__tests__/notify-fallback-watcher.test.ts` is restored before the patch cut so the release branch builds cleanly again.
+
+### Verified
+- `cargo test -p omx-runtime-core`
+- `npm run build`
+- `npm run lint`
+- `node --test dist/hooks/__tests__/notify-fallback-watcher.test.js`
+- `node --test dist/cli/__tests__/version-sync-contract.test.js`
+- `npm test`
+- `npm run smoke:packed-install`
+- `git diff --check origin/main...HEAD`
+
+## [0.11.12] - 2026-04-02
+
+Patch release for Windows flicker reductions, team/runtime seam cleanup, safer auto-nudge hygiene, cross-platform Node test execution, and workflow-doc alignment after `0.11.11`.
+
+### Fixed
+- **Windows terminal flicker reductions** — `windowsHide` coverage now spans the remaining child-process launch paths, and filesystem-based git info reads avoid the extra Windows console flash path. (PRs [#1104](https://github.com/Yeachan-Heo/oh-my-codex/pull/1104), [#1107](https://github.com/Yeachan-Heo/oh-my-codex/pull/1107), [#1123](https://github.com/Yeachan-Heo/oh-my-codex/pull/1123))
+- **Team/runtime seam cleanup** — team cwd metadata now resolves canonically from `manifest.v2`, and dispatch/mailbox transitions no longer straddle the remaining dual-write seam gaps. (PRs [#1114](https://github.com/Yeachan-Heo/oh-my-codex/pull/1114), [#1126](https://github.com/Yeachan-Heo/oh-my-codex/pull/1126))
+- **Auto-nudge / tmux session hygiene** — stale-turn auto-nudges stay disarmed after cooldown, readiness checks tolerate prompt scroll-off, and nudges stay limited to OMX-managed tmux sessions. (PRs [#1091](https://github.com/Yeachan-Heo/oh-my-codex/pull/1091), [#1093](https://github.com/Yeachan-Heo/oh-my-codex/pull/1093), [#1119](https://github.com/Yeachan-Heo/oh-my-codex/pull/1119))
+
+### Changed
+- **Cross-platform Node test runner** — Node test execution can now enumerate compiled test files without depending on POSIX `find`, making the release/CI test path portable across platforms. (PR [#1122](https://github.com/Yeachan-Heo/oh-my-codex/pull/1122))
+- **Workflow docs standardized** — onboarding/docs now consistently steer users through deep-interview -> ralplan -> team/ralph, with linked legacy skill roots resolved through one canonical path. (PRs [#1128](https://github.com/Yeachan-Heo/oh-my-codex/pull/1128), [#1132](https://github.com/Yeachan-Heo/oh-my-codex/pull/1132))
+- **Release metadata sync** — Node/Cargo package metadata, lockfiles, changelog, and release collateral are aligned to `0.11.12` for the patch cut.
+
+### Verified
+- `cargo check --workspace`
+- `npm run build`
+- `npm run lint`
+- `node --test dist/cli/__tests__/version-sync-contract.test.js`
+- release-workflow inline version-sync check from `.github/workflows/release.yml`
+- `npm run test:node:cross-platform`
+- `npm run smoke:packed-install`
+
+## [0.11.10] - 2026-03-30
+
+Patch release for approved handoff alias parsing hardening and release metadata synchronization after `0.11.9`.
+
+### Fixed
+- **Approved handoff alias parsing regression coverage** — planning artifact tests now protect single-quoted approved launch hints for both `$ralph` and `$team`, preventing quoting-form drift in execution handoff parsing. (direct commit `e08a746`)
+
+### Changed
+- **Release metadata sync** — Node and Cargo package metadata are bumped to `0.11.10` for this patch release.
+- **Release collateral refresh** — release notes and `RELEASE_BODY.md` are refreshed for the `0.11.10` cut.
+
+### Verified
+- `npx biome lint src/planning/__tests__/artifacts.test.ts`
+- `npm run build && node --test dist/planning/__tests__/artifacts.test.js`
+- `npm run test:sparkshell`
+- `npm run test:team:cross-rebase-smoke`
+- `npm run smoke:packed-install`
+- `npm test`
+
+## [0.11.9] - 2026-03-25
+
+Patch release for deeper deep-interview / ralplan coordination, setup repair, and safer live team supervision after `0.11.8`.
+
+### Added
+- **Live ralplan state visibility** — consensus planning now exposes observable runtime state so the pipeline, HUD, and attached guidance can reflect active ralplan progress more faithfully. (PR [#1060](https://github.com/Yeachan-Heo/oh-my-codex/pull/1060))
+- **Analyze skill trace refresh** — the shipped analyze skill now follows the OmC trace methodology with restored execution-policy contract wording, improving investigation guidance. (direct commits `fa01cb5`, `c0a0e1a`)
+
+### Fixed
+- **Deep-interview lock suppresses tmux-pane nudges** — active deep-interview lock state now blocks fallback tmux-pane nudges, and planning handoff applies stronger deep-interview pressure before execution can proceed. (PRs [#1062](https://github.com/Yeachan-Heo/oh-my-codex/pull/1062), [#1058](https://github.com/Yeachan-Heo/oh-my-codex/pull/1058))
+- **Setup stays compatible with Codex-managed TUI configs** — rerunning setup no longer rebreaks managed TUI sections, while explore-routing defaults remain aligned with setup guidance. (PRs [#1048](https://github.com/Yeachan-Heo/oh-my-codex/pull/1048), [#1053](https://github.com/Yeachan-Heo/oh-my-codex/pull/1053))
+- **HUD stateful-mode visibility restored** — active stateful modes are visible in the HUD again instead of disappearing during live sessions. (PR [#1055](https://github.com/Yeachan-Heo/oh-my-codex/pull/1055))
+- **Live worker supervision remains resilient** — fallback orchestration now stays alive while team workers are still active, and team flows auto-accept the Claude bypass prompt when required. (PR [#1043](https://github.com/Yeachan-Heo/oh-my-codex/pull/1043), direct commit `3f2eb67`)
+
+### Changed
+- **Maintenance refresh** — dev dependency baselines now use `c8@11.0.0` and `@types/node@25.5.0`, and the README adds a Star History chart. (PRs [#1049](https://github.com/Yeachan-Heo/oh-my-codex/pull/1049), [#1051](https://github.com/Yeachan-Heo/oh-my-codex/pull/1051); docs commit `ed96d42`)
+- **Release metadata sync** — Node and Cargo package metadata are bumped to `0.11.9` for this patch release.
+
+### Verified
+- `cargo check --workspace`
+- `npm run build`
+- `npm run lint`
+- `npm run check:no-unused`
+- `node --test --test-reporter=spec dist/cli/__tests__/version-sync-contract.test.js`
+- `node --test --test-reporter=spec dist/cli/__tests__/setup-refresh.test.js dist/cli/__tests__/setup-scope.test.js dist/cli/__tests__/doctor-warning-copy.test.js`
+- `node --test --test-reporter=spec dist/hooks/__tests__/explore-routing.test.js dist/hooks/__tests__/explore-sparkshell-guidance-contract.test.js dist/hooks/__tests__/deep-interview-contract.test.js dist/hooks/__tests__/notify-fallback-watcher.test.js dist/hooks/__tests__/notify-hook-auto-nudge.test.js dist/hooks/__tests__/agents-overlay.test.js`
+- `node --test --test-reporter=spec dist/hud/__tests__/index.test.js dist/hud/__tests__/render.test.js dist/hud/__tests__/state.test.js`
+- `node --test --test-reporter=spec dist/pipeline/__tests__/stages.test.js dist/ralplan/__tests__/runtime.test.js`
+
 ## [0.11.8] - 2026-03-23
 
 Hotfix release for deep-interview nudge suppression and duplicate fresh-leader nudge prevention.
@@ -16,6 +110,7 @@ Hotfix release for deep-interview nudge suppression and duplicate fresh-leader n
 - **Release metadata sync** — Node and Cargo package metadata are bumped to `0.11.8` for this hotfix release.
 
 ### Verified
+- `cargo check --workspace`
 - `npm run build`
 - `node --test --test-reporter=spec dist/hooks/__tests__/notify-hook-auto-nudge.test.js`
 - `node --test --test-reporter=spec dist/hooks/__tests__/notify-hook-team-leader-nudge.test.js`

@@ -3,11 +3,12 @@
  * Resolves Codex CLI config, skills, prompts, and state directories
  */
 
+import { createHash } from "crypto";
+import { existsSync } from "fs";
+import { readdir, readFile, realpath } from "fs/promises";
 import { dirname, join } from "path";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
-import { existsSync } from "fs";
-import { readdir } from "fs/promises";
 
 /** Codex CLI home directory (~/.codex/) */
 export function codexHome(): string {
@@ -44,12 +45,31 @@ export function projectSkillsDir(projectRoot?: string): string {
   return join(projectRoot || process.cwd(), ".codex", "skills");
 }
 
+/** Historical legacy user-level skills directory (~/.agents/skills/) */
+export function legacyUserSkillsDir(): string {
+  return join(homedir(), ".agents", "skills");
+}
+
 export type InstalledSkillScope = "project" | "user";
 
 export interface InstalledSkillDirectory {
   name: string;
   path: string;
   scope: InstalledSkillScope;
+}
+
+export interface SkillRootOverlapReport {
+  canonicalDir: string;
+  legacyDir: string;
+  canonicalExists: boolean;
+  legacyExists: boolean;
+  canonicalResolvedDir: string | null;
+  legacyResolvedDir: string | null;
+  sameResolvedTarget: boolean;
+  canonicalSkillCount: number;
+  legacySkillCount: number;
+  overlappingSkillNames: string[];
+  mismatchedSkillNames: string[];
 }
 
 async function readInstalledSkillsFromDir(
@@ -95,6 +115,66 @@ export async function listInstalledSkillDirectories(
   }
 
   return deduped;
+}
+
+export async function detectLegacySkillRootOverlap(
+  canonicalDir = userSkillsDir(),
+  legacyDir = legacyUserSkillsDir(),
+): Promise<SkillRootOverlapReport> {
+  const canonicalExists = existsSync(canonicalDir);
+  const legacyExists = existsSync(legacyDir);
+  const [canonicalSkills, legacySkills, canonicalResolvedDir, legacyResolvedDir] = await Promise.all([
+    readInstalledSkillsFromDir(canonicalDir, "user"),
+    readInstalledSkillsFromDir(legacyDir, "user"),
+    canonicalExists ? realpath(canonicalDir).catch(() => null) : Promise.resolve(null),
+    legacyExists ? realpath(legacyDir).catch(() => null) : Promise.resolve(null),
+  ]);
+
+  const canonicalHashes = await hashSkillDirectory(canonicalSkills);
+  const legacyHashes = await hashSkillDirectory(legacySkills);
+  const canonicalNames = new Set(canonicalSkills.map((skill) => skill.name));
+  const legacyNames = new Set(legacySkills.map((skill) => skill.name));
+  const overlappingSkillNames = [...canonicalNames]
+    .filter((name) => legacyNames.has(name))
+    .sort((a, b) => a.localeCompare(b));
+  const mismatchedSkillNames = overlappingSkillNames.filter(
+    (name) => canonicalHashes.get(name) !== legacyHashes.get(name),
+  );
+  const sameResolvedTarget =
+    canonicalResolvedDir !== null &&
+    legacyResolvedDir !== null &&
+    canonicalResolvedDir === legacyResolvedDir;
+
+  return {
+    canonicalDir,
+    legacyDir,
+    canonicalExists,
+    legacyExists,
+    canonicalResolvedDir,
+    legacyResolvedDir,
+    sameResolvedTarget,
+    canonicalSkillCount: canonicalSkills.length,
+    legacySkillCount: legacySkills.length,
+    overlappingSkillNames,
+    mismatchedSkillNames,
+  };
+}
+
+async function hashSkillDirectory(
+  skills: InstalledSkillDirectory[],
+): Promise<Map<string, string>> {
+  const hashes = new Map<string, string>();
+
+  for (const skill of skills) {
+    try {
+      const content = await readFile(join(skill.path, "SKILL.md"), "utf-8");
+      hashes.set(skill.name, createHash("sha256").update(content).digest("hex"));
+    } catch {
+      // Ignore unreadable SKILL.md files; existence is enough for overlap detection.
+    }
+  }
+
+  return hashes;
 }
 
 /** oh-my-codex state directory (.omx/state/) */

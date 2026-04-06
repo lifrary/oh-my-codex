@@ -265,7 +265,7 @@ describe('notify-hook/auto-nudge – normalizeAutoNudgeConfig', () => {
     assert.deepEqual(cfg.patterns, DEFAULT_STALL_PATTERNS);
     assert.equal(cfg.response, 'yes, proceed');
     assert.equal(cfg.delaySec, 3);
-    assert.equal(cfg.maxNudgesPerSession, Infinity);
+    assert.equal(cfg.ttlMs, 30_000);
   });
 
   it('respects enabled=false', async () => {
@@ -376,6 +376,12 @@ describe('notify-hook/auto-nudge – blocked deep-interview auto approvals', () 
     const { isBlockedAutoApprovalInput } = await loadModule('notify-hook/auto-nudge.js');
     assert.equal(isBlockedAutoApprovalInput('Next I should update the focused tests.'), true);
     assert.equal(isBlockedAutoApprovalInput('Maybe next I should update the focused tests.'), false);
+  });
+
+  it('normalizes custom blocked inputs before exact and prefix matching', async () => {
+    const { isBlockedAutoApprovalInput } = await loadModule('notify-hook/auto-nudge.js');
+    assert.equal(isBlockedAutoApprovalInput('GO ahead!!!', [' go ahead ']), true);
+    assert.equal(isBlockedAutoApprovalInput('Next I should update the focused tests.', [' Next I Should ']), true);
   });
 
   it('does not block unrelated responses', async () => {

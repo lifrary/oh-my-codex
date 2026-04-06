@@ -7,11 +7,13 @@ import { existsSync } from "fs";
 import { join, basename } from "path";
 import {
   stripExistingOmxBlocks,
+  stripOmxEnvSettings,
   stripOmxTopLevelKeys,
   stripOmxFeatureFlags,
 } from "../config/generator.js";
 import { getPackageRoot } from "../utils/package.js";
 import { AGENT_DEFINITIONS } from "../agents/definitions.js";
+import { detectLegacySkillRootOverlap } from "../utils/paths.js";
 import { resolveScopeDirectories, type SetupScope } from "./setup.js";
 import { readPersistedSetupScope } from "./index.js";
 import { isOmxGeneratedAgentsMd } from "../utils/agents-md.js";
@@ -36,6 +38,7 @@ interface UninstallSummary {
   agentConfigsRemoved: number;
   agentsMdRemoved: boolean;
   cacheDirectoryRemoved: boolean;
+  legacySkillRootWarning: string | null;
 }
 
 const OMX_MCP_SERVERS = [
@@ -51,6 +54,7 @@ function detectOmxConfigArtifacts(config: string): {
   hasTuiSection: boolean;
   hasTopLevelKeys: boolean;
   hasFeatureFlags: boolean;
+  hasExploreRoutingEnv: boolean;
 } {
   const hasMcpServers = OMX_MCP_SERVERS.filter((name) =>
     new RegExp(`\\[mcp_servers\\.${name}\\]`).test(config),
@@ -77,6 +81,7 @@ function detectOmxConfigArtifacts(config: string): {
   const hasFeatureFlags =
     /^\s*multi_agent\s*=\s*true/m.test(config) ||
     /^\s*child_agents_md\s*=\s*true/m.test(config);
+  const hasExploreRoutingEnv = /^\s*USE_OMX_EXPLORE_CMD\s*=/m.test(config);
 
   return {
     hasMcpServers,
@@ -84,6 +89,7 @@ function detectOmxConfigArtifacts(config: string): {
     hasTuiSection,
     hasTopLevelKeys,
     hasFeatureFlags,
+    hasExploreRoutingEnv,
   };
 }
 
@@ -134,6 +140,9 @@ async function cleanConfig(
 
   // Strip feature flags
   config = stripOmxFeatureFlags(config);
+
+  // Strip OMX-managed env defaults
+  config = stripOmxEnvSettings(config);
 
   // Normalize trailing whitespace
   config = config.trimEnd() + "\n";
@@ -292,6 +301,36 @@ async function removeCacheDirectory(
   return true;
 }
 
+async function detectLegacySkillRootWarning(
+  scope: SetupScope,
+): Promise<string | null> {
+  if (scope !== "user") return null;
+
+  const overlap = await detectLegacySkillRootOverlap();
+  if (!overlap.legacyExists || overlap.sameResolvedTarget) {
+    return null;
+  }
+
+  if (overlap.overlappingSkillNames.length === 0) {
+    return (
+      `legacy ~/.agents/skills still exists (${overlap.legacySkillCount} skills). ` +
+      "omx uninstall does not remove that historical root automatically; " +
+      "archive or remove ~/.agents/skills if Codex still shows stale or duplicate skills"
+    );
+  }
+
+  const mismatchMessage =
+    overlap.mismatchedSkillNames.length > 0
+      ? `; ${overlap.mismatchedSkillNames.length} differ in SKILL.md content`
+      : "";
+  return (
+    `${overlap.overlappingSkillNames.length} overlapping skill names remain between ` +
+    `${overlap.canonicalDir} and ${overlap.legacyDir}${mismatchMessage}. ` +
+    "omx uninstall only removes the active canonical skill root; " +
+    "archive or remove ~/.agents/skills if Codex still shows duplicates"
+  );
+}
+
 function printSummary(summary: UninstallSummary, dryRun: boolean): void {
   const prefix = dryRun ? "[dry-run] Would remove" : "Removed";
 
@@ -336,6 +375,9 @@ function printSummary(summary: UninstallSummary, dryRun: boolean): void {
   }
   if (summary.cacheDirectoryRemoved) {
     console.log(`  ${prefix} .omx/ cache directory`);
+  }
+  if (summary.legacySkillRootWarning) {
+    console.log(`  Warning: ${summary.legacySkillRootWarning}`);
   }
 
   const totalActions =
@@ -387,7 +429,10 @@ export async function uninstall(options: UninstallOptions = {}): Promise<void> {
     agentConfigsRemoved: 0,
     agentsMdRemoved: false,
     cacheDirectoryRemoved: false,
+    legacySkillRootWarning: null,
   };
+
+  summary.legacySkillRootWarning = await detectLegacySkillRootWarning(scope);
 
   // Step 1: Clean config.toml
   if (keepConfig) {
