@@ -6,6 +6,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { buildManagedCodexHooksConfig } from '../../config/codex-hooks.js';
 
 function runOmx(
   cwd: string,
@@ -80,6 +81,13 @@ function buildOmxConfig(): string {
     '[mcp_servers.omx_trace]',
     'command = "node"',
     'args = ["/path/to/trace-server.js"]',
+    'enabled = true',
+    'startup_timeout_sec = 5',
+    '',
+    '# OMX Wiki MCP Server',
+    '[mcp_servers.omx_wiki]',
+    'command = "node"',
+    'args = ["/path/to/wiki-server.js"]',
     'enabled = true',
     'startup_timeout_sec = 5',
     '',
@@ -175,6 +183,11 @@ function buildMixedConfig(): string {
     'args = ["/path/to/trace-server.js"]',
     'enabled = true',
     '',
+    '[mcp_servers.omx_wiki]',
+    'command = "node"',
+    'args = ["/path/to/wiki-server.js"]',
+    'enabled = true',
+    '',
     '[agents.executor]',
     'description = "Code implementation"',
     'config_file = "/path/to/executor.toml"',
@@ -196,7 +209,10 @@ describe('omx uninstall', () => {
       const codexDir = join(home, '.codex');
       await mkdir(codexDir, { recursive: true });
       await writeFile(join(codexDir, 'config.toml'), buildOmxConfig());
-      await writeFile(join(codexDir, 'hooks.json'), '{"hooks":{}}\n');
+      await writeFile(
+        join(codexDir, 'hooks.json'),
+        JSON.stringify(buildManagedCodexHooksConfig(wd), null, 2) + '\n',
+      );
 
       const res = runOmx(wd, ['uninstall', '--dry-run'], { HOME: home });
       if (shouldSkipForSpawnPermissions(res.error)) return;
@@ -222,7 +238,10 @@ describe('omx uninstall', () => {
       const codexDir = join(home, '.codex');
       await mkdir(codexDir, { recursive: true });
       await writeFile(join(codexDir, 'config.toml'), buildOmxConfig());
-      await writeFile(join(codexDir, 'hooks.json'), '{"hooks":{}}\n');
+      await writeFile(
+        join(codexDir, 'hooks.json'),
+        JSON.stringify(buildManagedCodexHooksConfig(wd), null, 2) + '\n',
+      );
 
       const res = runOmx(wd, ['uninstall'], { HOME: home });
       if (shouldSkipForSpawnPermissions(res.error)) return;
@@ -235,6 +254,7 @@ describe('omx uninstall', () => {
       assert.doesNotMatch(config, /omx_memory/);
       assert.doesNotMatch(config, /omx_code_intel/);
       assert.doesNotMatch(config, /omx_trace/);
+      assert.doesNotMatch(config, /omx_wiki/);
       assert.doesNotMatch(config, /\[agents\.executor\]/);
       assert.doesNotMatch(config, /\[tui\]/);
       assert.doesNotMatch(config, /notify\s*=/);
@@ -274,6 +294,48 @@ describe('omx uninstall', () => {
       assert.doesNotMatch(config, /multi_agent/);
       assert.doesNotMatch(config, /child_agents_md/);
       assert.doesNotMatch(config, /codex_hooks/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves user hooks while removing OMX-managed wrappers', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(join(codexDir, 'config.toml'), buildOmxConfig());
+      await writeFile(
+        join(codexDir, 'hooks.json'),
+        JSON.stringify(
+          {
+            hooks: {
+              SessionStart: [
+                {
+                  hooks: [
+                    { type: 'command', command: 'node "/repo/dist/scripts/codex-native-hook.js"' },
+                    { type: 'command', command: 'echo keep-me' },
+                  ],
+                },
+              ],
+            },
+            version: 1,
+          },
+          null,
+          2,
+        ) + '\n',
+      );
+
+      const res = runOmx(wd, ['uninstall'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+      assert.equal(existsSync(join(codexDir, 'hooks.json')), true);
+
+      const hooks = await readFile(join(codexDir, 'hooks.json'), 'utf-8');
+      assert.match(hooks, /echo keep-me/);
+      assert.match(hooks, /"version": 1/);
+      assert.doesNotMatch(hooks, /codex-native-hook\.js/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -406,7 +468,7 @@ describe('omx uninstall', () => {
       if (shouldSkipForSpawnPermissions(res.error)) return;
       assert.equal(res.status, 0, res.stderr || res.stdout);
       assert.match(res.stdout, /Uninstall summary/);
-      assert.match(res.stdout, /MCP servers: omx_state, omx_memory, omx_code_intel, omx_trace/);
+      assert.match(res.stdout, /MCP servers: omx_state, omx_memory, omx_code_intel, omx_trace, omx_wiki/);
       assert.match(res.stdout, /Agent entries: 1/);
       assert.match(res.stdout, /TUI status line section/);
       assert.match(res.stdout, /Top-level keys/);

@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { chmod, mkdtemp, readFile, rm, mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
@@ -10,6 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   buildExploreHarnessArgs,
+  buildExplorePromptWithWikiContext,
   exploreCommand,
   EXPLORE_USAGE,
   loadExplorePrompt,
@@ -21,6 +22,7 @@ import {
   resolveExploreSparkShellRoute,
   resolvePackagedExploreHarnessCommand,
 } from '../explore.js';
+import { writePage, WIKI_SCHEMA_VERSION } from '../../wiki/index.js';
 import { withPackagedExploreHarnessHidden, withPackagedExploreHarnessLock } from './packaged-explore-harness-lock.js';
 
 function runOmx(
@@ -166,6 +168,56 @@ printf '# Answer\nHarness completed\n' > "$output_path"
   return stub;
 }
 
+async function writePosixPackageManagerCodexShim(wd: string, capturePath: string): Promise<string> {
+  const packageRoot = join(wd, 'node_modules', '@openai', 'codex');
+  const binDir = join(wd, 'node_modules', '.bin');
+  const entrypointPath = join(packageRoot, 'bin', 'codex.js');
+  const shimPath = join(binDir, 'codex');
+  await mkdir(join(packageRoot, 'bin'), { recursive: true });
+  await mkdir(binDir, { recursive: true });
+  await writeFile(
+    entrypointPath,
+    `const fs = require('node:fs');
+const path = require('node:path');
+
+const args = process.argv.slice(2);
+let outputPath = '';
+for (let i = 0; i < args.length; i += 1) {
+  const value = args[i];
+  if (value === '-o' && i + 1 < args.length) {
+    outputPath = args[i + 1];
+    i += 1;
+  }
+}
+if (!outputPath) {
+  process.stderr.write('missing -o output path\\n');
+  process.exit(1);
+}
+
+const payload = [
+  'ARGV0=' + process.argv[0],
+  'ARGV1=' + process.argv[1],
+  'PATH=' + (process.env.PATH || ''),
+  'SHELL=' + (process.env.SHELL || ''),
+].join('\\n') + '\\n';
+fs.writeFileSync(${JSON.stringify(capturePath)}, payload);
+fs.writeFileSync(outputPath, '# Answer\\nHarness completed\\n');
+`,
+  );
+  await writeFile(
+    shimPath,
+    `#!/bin/sh
+basedir=$(dirname "$0")
+if [ -x "$basedir/node" ]; then
+  exec "$basedir/node" "$basedir/../@openai/codex/bin/codex.js" "$@"
+fi
+exec node "$basedir/../@openai/codex/bin/codex.js" "$@"
+`,
+  );
+  await chmod(shimPath, 0o755);
+  return shimPath;
+}
+
 async function writeScenarioCodexStub(wd: string, body: string): Promise<string> {
   const stub = join(wd, 'codex-scenario-stub.sh');
   await writeFile(
@@ -258,6 +310,95 @@ describe('loadExplorePrompt', () => {
       const promptPath = join(wd, 'prompt.md');
       await writeFile(promptPath, '  find symbol refs  \n');
       assert.equal(await loadExplorePrompt({ promptFile: promptPath }), 'find symbol refs');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('buildExplorePromptWithWikiContext', () => {
+  it('injects wiki matches into the explore prompt when local wiki pages exist', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-explore-wiki-'));
+    try {
+      writePage(wd, {
+        filename: 'runtime.md',
+        frontmatter: {
+          title: 'Runtime Architecture',
+          tags: ['runtime', 'hooks'],
+          created: '2026-01-01T00:00:00.000Z',
+          updated: '2026-01-01T00:00:00.000Z',
+          sources: ['test'],
+          links: [],
+          category: 'architecture',
+          confidence: 'high',
+          schemaVersion: WIKI_SCHEMA_VERSION,
+        },
+        content: '\n# Runtime Architecture\n\nSessionStart uses native hooks and session-end uses runtime cleanup.\n',
+      });
+
+      const prompt = buildExplorePromptWithWikiContext('how does session-start work', wd);
+      assert.match(prompt, /\[OMX Wiki Context\]/);
+      assert.match(prompt, /Runtime Architecture/);
+      assert.match(prompt, /prefer repository-backed facts/i);
+      assert.match(prompt, /Wiki mismatch/);
+      assert.match(prompt, /Original Explore Prompt/);
+      assert.equal(existsSync(join(wd, '.omx', 'wiki', 'log.md')), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not mutate wiki logs when building read-only wiki context', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-explore-wiki-log-'));
+    try {
+      writePage(wd, {
+        filename: 'runtime.md',
+        frontmatter: {
+          title: 'Runtime Architecture',
+          tags: ['runtime', 'hooks'],
+          created: '2026-01-01T00:00:00.000Z',
+          updated: '2026-01-01T00:00:00.000Z',
+          sources: ['test'],
+          links: [],
+          category: 'architecture',
+          confidence: 'high',
+          schemaVersion: WIKI_SCHEMA_VERSION,
+        },
+        content: '\n# Runtime Architecture\n\nSessionStart uses native hooks and session-end uses runtime cleanup.\n',
+      });
+
+      buildExplorePromptWithWikiContext('session-start lifecycle', wd);
+      const logPath = join(wd, '.omx', 'wiki', 'log.md');
+      assert.equal(existsSync(logPath), false);
+
+      // sanity: direct query callers still log by default
+      const { queryWiki } = await import('../../wiki/index.js');
+      queryWiki(wd, 'session-start lifecycle');
+      assert.equal(existsSync(logPath), true);
+      assert.match(readFileSync(logPath, 'utf8'), /Query "session-start lifecycle"/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('warns when wiki pages are missing or too weak', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-explore-no-wiki-'));
+    try {
+      const prompt = buildExplorePromptWithWikiContext('find auth', wd);
+      assert.match(prompt, /\[OMX Wiki Status\]/);
+      assert.match(prompt, /build an initial project wiki/i);
+      assert.match(prompt, /Original Explore Prompt/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('warns when the wiki directory is missing entirely', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-explore-missing-wiki-'));
+    try {
+      const prompt = buildExplorePromptWithWikiContext('find auth', wd);
+      assert.match(prompt, /Wiki evidence is weak or missing/i);
+      assert.match(prompt, /build an initial project wiki/i);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -493,14 +634,14 @@ describe('resolveExploreHarnessCommand', () => {
 
 describe('buildExploreHarnessArgs', () => {
   it('includes cwd, prompt, prompt contract, and constrained model settings', () => {
-    const args = buildExploreHarnessArgs('find auth', '/repo', {
+    const wd = join(tmpdir(), 'omx-explore-arg-test');
+    const args = buildExploreHarnessArgs('find auth', wd, {
       OMX_EXPLORE_SPARK_MODEL: 'spark-model',
     } as NodeJS.ProcessEnv, '/pkg');
-    assert.deepEqual(args, [
-      '--cwd',
-      '/repo',
-      '--prompt',
-      'find auth',
+    assert.deepEqual(args.slice(0, 3), ['--cwd', wd, '--prompt']);
+    assert.match(args[3] || '', /Original Explore Prompt/);
+    assert.match(args[3] || '', /find auth/);
+    assert.deepEqual(args.slice(4), [
       '--prompt-file',
       '/pkg/prompts/explore-harness.md',
       '--model-spark',
@@ -717,6 +858,33 @@ describe('exploreCommand', () => {
         assert.match(captured, /--ARGV--[\s\S]*\nexec\n/);
         assert.match(captured, /--ALLOWED_STDOUT--[\s\S]*ripgrep/i);
         assert.match(captured, /--BLOCKED_STDERR--[\s\S]*not on the omx explore allowlist/);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('bypasses a POSIX package-manager codex shim without broadening the allowlisted PATH', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-explore-harness-posix-shim-'));
+    try {
+      await withPackagedExploreHarnessHidden(async () => {
+        const capturePath = join(wd, 'capture.txt');
+        const codexShim = await writePosixPackageManagerCodexShim(wd, capturePath);
+        const testPath = await createExploreTestPath(wd);
+
+        const result = runOmx(wd, ['explore', '--prompt', 'find buildTmuxPaneCommand'], {
+          OMX_EXPLORE_CODEX_BIN: codexShim,
+          PATH: testPath,
+        });
+        if (shouldSkipForSpawnPermissions(result.error)) return;
+
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.equal(result.stdout, '# Answer\nHarness completed\n');
+        const captured = await readFile(capturePath, 'utf-8');
+        assert.match(captured, /ARGV0=.*\/node$/m);
+        assert.match(captured, /ARGV1=.*node_modules\/@openai\/codex\/bin\/codex\.js$/m);
+        assert.match(captured, /PATH=.*omx-explore-allowlist-/);
+        assert.doesNotMatch(captured, /PATH=.*node_modules\/\.bin/);
       });
     } finally {
       await rm(wd, { recursive: true, force: true });

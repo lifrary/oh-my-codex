@@ -28,8 +28,12 @@ import {
   omxPlansDir,
   omxLogsDir,
 } from "../utils/paths.js";
-import { buildMergedConfig, getRootModelName } from "../config/generator.js";
-import { buildManagedCodexHooksConfig } from "../config/codex-hooks.js";
+import {
+  buildMergedConfig,
+  getRootModelName,
+  hasLegacyOmxTeamRunTable,
+} from "../config/generator.js";
+import { mergeManagedCodexHooksConfig } from "../config/codex-hooks.js";
 import {
   getLegacyUnifiedMcpRegistryCandidate,
   getUnifiedMcpRegistryCandidates,
@@ -46,6 +50,7 @@ import { tryReadCatalogManifest } from "../catalog/reader.js";
 import { DEFAULT_FRONTIER_MODEL } from "../config/models.js";
 import {
   addGeneratedAgentsMarker,
+  hasOmxManagedAgentsSections,
   isOmxGeneratedAgentsMd,
 } from "../utils/agents-md.js";
 import {
@@ -113,6 +118,7 @@ interface SetupBackupContext {
 interface ManagedConfigResult {
   finalConfig: string;
   omxManagesTui: boolean;
+  repairedLegacyTeamRunTable: boolean;
 }
 
 interface LegacySkillOverlapNotice {
@@ -137,6 +143,7 @@ const PROJECT_GITIGNORE_ENTRIES = [
   "!.codex/prompts/**",
 ] as const;
 const LEGACY_PROJECT_GITIGNORE_ENTRIES = [".codex/"] as const;
+const SETUP_ONLY_INSTALLABLE_SKILLS = new Set(["wiki"]);
 
 function applyScopePathRewritesToAgentsTemplate(
   content: string,
@@ -826,6 +833,11 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
     { codexVersionProbe: options.codexVersionProbe, dryRun, verbose, modelUpgradePrompt },
   );
   const resolvedConfig = managedConfig.finalConfig;
+  if (managedConfig.repairedLegacyTeamRunTable) {
+    console.log(
+      "  Removed retired [mcp_servers.omx_team_run] config during refresh.",
+    );
+  }
   if (resolvedScope.scope === "user") {
     await syncClaudeCodeMcpSettings(
       sharedMcpRegistry,
@@ -836,11 +848,13 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
   }
   console.log(`  Config refresh complete (${scopeDirs.codexConfigFile}).\n`);
 
-  const hooksConfig = JSON.stringify(
-    buildManagedCodexHooksConfig(pkgRoot),
-    null,
-    2,
-  ) + "\n";
+  const existingHooksContent = existsSync(scopeDirs.codexHooksFile)
+    ? await readFile(scopeDirs.codexHooksFile, "utf-8")
+    : null;
+  const hooksConfig = mergeManagedCodexHooksConfig(
+    existingHooksContent,
+    pkgRoot,
+  );
   await syncManagedContent(
     hooksConfig,
     scopeDirs.codexHooksFile,
@@ -897,7 +911,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
     if (agentsMdExists) {
       const existing = await readFile(agentsMdDst, "utf-8");
       changed = existing !== rewritten;
-      if (isOmxGeneratedAgentsMd(existing)) {
+      if (hasOmxManagedAgentsSections(existing)) {
         managedRefreshContent = upsertAgentsModelTable(
           existing,
           modelTableContext,
@@ -1463,6 +1477,11 @@ export async function installSkills(
     : null;
   const isInstallableStatus = (status: string | undefined): boolean =>
     status === "active" || status === "internal";
+  const isSetupInstallableSkill = (
+    skillName: string,
+    status: string | undefined,
+  ): boolean =>
+    isInstallableStatus(status) || SETUP_ONLY_INSTALLABLE_SKILLS.has(skillName);
   const entries = await readdir(srcDir, { withFileTypes: true });
   const staleCandidateSkillNames = new Set(
     manifest?.skills.map((skill) => skill.name) ?? [],
@@ -1471,7 +1490,7 @@ export async function installSkills(
     if (!entry.isDirectory()) continue;
     staleCandidateSkillNames.add(entry.name);
     const status = skillStatusByName?.get(entry.name);
-    if (skillStatusByName && !isInstallableStatus(status)) {
+    if (skillStatusByName && !isSetupInstallableSkill(entry.name, status)) {
       summary.skipped += 1;
       if (options.verbose) {
         const label = status ?? "unlisted";
@@ -1525,7 +1544,7 @@ export async function installSkills(
   if (options.force && manifest && existsSync(dstDir)) {
     for (const staleSkill of staleCandidateSkillNames) {
       const status = skillStatusByName?.get(staleSkill);
-      if (isInstallableStatus(status)) continue;
+      if (isSetupInstallableSkill(staleSkill, status)) continue;
 
       const staleSkillDir = join(dstDir, staleSkill);
       if (!existsSync(staleSkillDir)) continue;
@@ -1561,6 +1580,7 @@ async function updateManagedConfig(
   const existing = existsSync(configPath)
     ? await readFile(configPath, "utf-8")
     : "";
+  const hadLegacyTeamRunTable = hasLegacyOmxTeamRunTable(existing);
   const currentModel = getRootModelName(existing);
   let modelOverride: string | undefined;
   const codexVersion =
@@ -1592,7 +1612,11 @@ async function updateManagedConfig(
 
   if (!changed) {
     summary.unchanged += 1;
-    return { finalConfig, omxManagesTui };
+    return {
+      finalConfig,
+      omxManagesTui,
+      repairedLegacyTeamRunTable: false,
+    };
   }
 
   if (
@@ -1627,7 +1651,12 @@ async function updateManagedConfig(
       `  ${options.dryRun ? "would update" : "updated"} config ${configPath}`,
     );
   }
-  return { finalConfig, omxManagesTui };
+  return {
+    finalConfig,
+    omxManagesTui,
+    repairedLegacyTeamRunTable:
+      hadLegacyTeamRunTable && !hasLegacyOmxTeamRunTable(finalConfig),
+  };
 }
 
 function getClaudeCodeSettingsPath(homeDir = homedir()): string {

@@ -136,6 +136,41 @@ describe("generateOverlay", () => {
     assert.ok(overlay.includes("iteration 1/5"));
   });
 
+  it("lists both approved combined workflow members from canonical skill state", async () => {
+    const sessionId = "combined-session";
+    const sessionDir = join(tempDir, ".omx", "state", "sessions", sessionId);
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      join(tempDir, ".omx", "state", "session.json"),
+      JSON.stringify({ session_id: sessionId }),
+    );
+    await writeFile(
+      join(sessionDir, "skill-active-state.json"),
+      JSON.stringify({
+        active: true,
+        skill: "team",
+        phase: "running",
+        session_id: sessionId,
+        active_skills: [
+          { skill: "team", phase: "running", active: true, session_id: sessionId },
+          { skill: "ralph", phase: "executing", active: true, session_id: sessionId },
+        ],
+      }),
+    );
+    await writeFile(
+      join(sessionDir, "team-state.json"),
+      JSON.stringify({ active: true, current_phase: "running" }),
+    );
+    await writeFile(
+      join(sessionDir, "ralph-state.json"),
+      JSON.stringify({ active: true, iteration: 2, max_iterations: 5, current_phase: "executing" }),
+    );
+
+    const overlay = await generateOverlay(tempDir, sessionId);
+    assert.match(overlay, /- team: phase: running/);
+    assert.match(overlay, /- ralph: iteration 2\/5, phase: executing/);
+  });
+
   it("generates overlay with notepad priority content", async () => {
     await writeFile(
       join(tempDir, ".omx", "notepad.md"),
@@ -365,6 +400,64 @@ describe("resolveSessionOrchestrationMode", () => {
 
     const mode = await resolveSessionOrchestrationMode(tempDir, sessionId);
     assert.equal(mode, "team");
+  });
+
+  it("active mode summary follows canonical session skill state instead of stale root mode files", async () => {
+    const sessionId = "sess-active-summary";
+    const rootStateDir = join(tempDir, ".omx", "state");
+    const sessionDir = join(rootStateDir, "sessions", sessionId);
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      join(rootStateDir, "ralph-state.json"),
+      JSON.stringify({ active: true, iteration: 9, max_iterations: 10, current_phase: "stale-root" }),
+    );
+    await writeFile(
+      join(sessionDir, "skill-active-state.json"),
+      JSON.stringify({
+        active: true,
+        skill: "team",
+        phase: "running",
+        session_id: sessionId,
+        active_skills: [{ skill: "team", phase: "running", active: true, session_id: sessionId }],
+      }),
+    );
+    await writeFile(
+      join(sessionDir, "team-state.json"),
+      JSON.stringify({ active: true, team_name: "delta" }),
+    );
+
+    const overlay = await generateOverlay(tempDir, sessionId);
+    assert.ok(overlay.includes("- team: phase: running"));
+    assert.equal(overlay.includes("ralph"), false);
+  });
+
+  it("active mode summary suppresses stale autoresearch mode files when canonical session skill state excludes it", async () => {
+    const sessionId = "sess-autoresearch-summary";
+    const rootStateDir = join(tempDir, ".omx", "state");
+    const sessionDir = join(rootStateDir, "sessions", sessionId);
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      join(rootStateDir, "autoresearch-state.json"),
+      JSON.stringify({ active: true, current_phase: "running" }),
+    );
+    await writeFile(
+      join(sessionDir, "skill-active-state.json"),
+      JSON.stringify({
+        active: true,
+        skill: "team",
+        phase: "running",
+        session_id: sessionId,
+        active_skills: [{ skill: "team", phase: "running", active: true, session_id: sessionId }],
+      }),
+    );
+    await writeFile(
+      join(sessionDir, "team-state.json"),
+      JSON.stringify({ active: true, team_name: "delta" }),
+    );
+
+    const overlay = await generateOverlay(tempDir, sessionId);
+    assert.ok(overlay.includes("- team: phase: running"));
+    assert.equal(overlay.includes("- autoresearch:"), false);
   });
 });
 

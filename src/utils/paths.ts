@@ -30,6 +30,22 @@ function resolveLauncherPath(rawPath: string, baseCwd: string): string {
   }
 }
 
+export function canonicalizeComparablePath(rawPath: string): string {
+  const absolutePath = resolve(rawPath);
+  if (!existsSync(absolutePath)) return absolutePath;
+  try {
+    return typeof realpathSync.native === "function"
+      ? realpathSync.native(absolutePath)
+      : realpathSync(absolutePath);
+  } catch {
+    return absolutePath;
+  }
+}
+
+export function sameFilePath(leftPath: string, rightPath: string): boolean {
+  return canonicalizeComparablePath(leftPath) === canonicalizeComparablePath(rightPath);
+}
+
 export function resolveOmxEntryPath(
   options: {
     argv1?: string | null;
@@ -46,6 +62,28 @@ export function resolveOmxEntryPath(
 
   const startupCwd = String(env[OMX_STARTUP_CWD_ENV] ?? "").trim() || cwd;
   return resolveLauncherPath(rawPath, startupCwd);
+}
+
+function isOmxCliEntryPath(value: string | null | undefined): boolean {
+  if (typeof value !== "string") return false;
+  const normalized = value.trim().replace(/\\/g, "/");
+  return normalized.endsWith('/dist/cli/omx.js') || normalized.endsWith('/omx.js')
+}
+
+export function resolveOmxCliEntryPath(
+  options: {
+    argv1?: string | null;
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    packageRootDir?: string;
+  } = {},
+): string | null {
+  const entry = resolveOmxEntryPath(options);
+  if (isOmxCliEntryPath(entry)) return entry;
+
+  const packageRootDir = options.packageRootDir || packageRoot();
+  const fallback = resolveLauncherPath(join(packageRootDir, 'dist', 'cli', 'omx.js'), options.cwd || process.cwd());
+  return existsSync(fallback) ? fallback : entry;
 }
 
 export function rememberOmxLaunchContext(
@@ -248,9 +286,19 @@ export function omxNotepadPath(projectRoot?: string): string {
   return join(projectRoot || process.cwd(), ".omx", "notepad.md");
 }
 
+/** oh-my-codex wiki directory (.omx/wiki/) */
+export function omxWikiDir(projectRoot?: string): string {
+  return join(projectRoot || process.cwd(), ".omx", "wiki");
+}
+
 /** oh-my-codex plans directory (.omx/plans/) */
 export function omxPlansDir(projectRoot?: string): string {
   return join(projectRoot || process.cwd(), ".omx", "plans");
+}
+
+/** oh-my-codex adapters directory (.omx/adapters/) */
+export function omxAdaptersDir(projectRoot?: string): string {
+  return join(projectRoot || process.cwd(), ".omx", "adapters");
 }
 
 /** oh-my-codex logs directory (.omx/logs/) */

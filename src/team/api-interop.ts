@@ -16,6 +16,7 @@ import { readTeamEvents, waitForTeamEvent } from './state/events.js';
 import { queueDirectMailboxMessage } from './mcp-comm.js';
 import { appendTeamDeliveryLogForCwd } from './delivery-log.js';
 import { isTerminalPhase } from './orchestrator.js';
+import { readLatestTeamProgressEvidenceMs } from './progress-evidence.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
 import { buildLeaderMailboxTriggerDirective, buildMailboxTriggerDirective } from './worker-bootstrap.js';
 import {
@@ -309,6 +310,15 @@ function readLatestLeaderRuntimeActivityMs(cwd: string): number {
   } catch {
     return Number.NaN;
   }
+}
+
+async function readLatestLeaderProgressEvidenceMs(cwd: string, teamName: string): Promise<number> {
+  const [leaderRuntimeMs, teamProgressMs] = await Promise.all([
+    Promise.resolve(readLatestLeaderRuntimeActivityMs(cwd)),
+    readLatestTeamProgressEvidenceMs(cwd, teamName).catch(() => Number.NaN),
+  ]);
+  const candidates = [leaderRuntimeMs, teamProgressMs].filter((value) => Number.isFinite(value));
+  return candidates.length > 0 ? Math.max(...candidates) : Number.NaN;
 }
 
 function buildStallState(
@@ -1040,7 +1050,7 @@ export async function executeTeamApiOperation(
           teamReadLeaderAttention(teamName, cwd),
           listMailboxMessages(teamName, 'leader-fixed', cwd).catch(() => []),
           teamListDispatchRequests(teamName, cwd, { to_worker: 'leader-fixed', limit: 200 }).catch(() => []),
-          readLatestLeaderRuntimeActivityMs(cwd),
+          readLatestLeaderProgressEvidenceMs(cwd, teamName),
         ]);
         if (!summary) {
           return { ok: false, operation, error: { code: 'team_not_found', message: 'team_not_found' } };
@@ -1086,7 +1096,8 @@ export async function executeTeamApiOperation(
         const teamName = String(args.team_name || '').trim();
         if (!teamName) return { ok: false, operation, error: { code: 'invalid_input', message: 'team_name is required' } };
         const force = args.force === true;
-        await shutdownTeam(teamName, cwd, { force });
+        const confirmIssues = args.confirm_issues === true || args.confirmIssues === true;
+        await shutdownTeam(teamName, cwd, { force, confirmIssues });
         return { ok: true, operation, data: { team_name: teamName, cleanup_mode: 'shutdown' } };
       }
       case 'orphan-cleanup': {

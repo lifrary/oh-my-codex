@@ -1,6 +1,7 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { updateModeState, startMode, readModeState } from '../modes/base.js';
+import { getStatePath, validateSessionId } from '../mcp/state-paths.js';
 import { monitorTeam, resumeTeam, shutdownTeam, startTeam, type TeamRuntime, type TeamSnapshot } from '../team/runtime.js';
 import { DEFAULT_MAX_WORKERS } from '../team/state.js';
 import { sanitizeTeamName } from '../team/tmux-session.js';
@@ -46,6 +47,23 @@ interface TeamFollowupContext {
   explicitWorkerCount: boolean;
   agentType?: string;
   explicitAgentType?: boolean;
+}
+
+function persistExactTeamModeState(
+  cwd: string,
+  updates: Record<string, unknown>,
+  sessionId?: string,
+): boolean {
+  const statePath = getStatePath('team', cwd, sessionId);
+  if (!existsSync(statePath)) return false;
+
+  try {
+    const current = JSON.parse(readFileSync(statePath, 'utf-8')) as Record<string, unknown>;
+    writeFileSync(statePath, JSON.stringify({ ...current, ...updates }, null, 2));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function readPersistedTeamFollowupState(cwd: string): {
@@ -128,7 +146,7 @@ Usage: omx team [N:agent-type] "<task description>"
        omx team status <team-name> [--json] [--tail-lines <100-1000>]
        omx team await <team-name> [--timeout-ms <ms>] [--after-event-id <id>] [--json]
        omx team resume <team-name>
-       omx team shutdown <team-name> [--force]
+       omx team shutdown <team-name> [--force] [--confirm-issues]
        omx team api <operation> [--input <json>] [--json]
        omx team api --help
 
@@ -199,7 +217,7 @@ const TEAM_API_OPERATION_OPTIONAL_FIELDS: Partial<Record<TeamApiOperation, strin
   'create-task': ['owner', 'blocked_by', 'requires_code_change'],
   'update-task': ['subject', 'description', 'blocked_by', 'requires_code_change'],
   'claim-task': ['expected_version'],
-  'cleanup': ['force'],
+  'cleanup': ['force', 'confirm_issues'],
   'transition-task-status': ['result', 'error'],
   'read-shutdown-ack': ['min_updated_at'],
   'write-worker-identity': [
@@ -216,7 +234,7 @@ const TEAM_API_OPERATION_NOTES: Partial<Record<TeamApiOperation, string>> = {
   'update-task': 'Only non-lifecycle task metadata can be updated.',
   'release-task-claim': 'Use this only for rollback/requeue to pending (not for completion).',
   'transition-task-status': 'Lifecycle flow is claim-safe and typically transitions in_progress -> completed|failed.',
-  'cleanup': 'Uses the runtime shutdown contract; use orphan-cleanup only for known orphan recovery.',
+  'cleanup': 'Uses the runtime shutdown contract; add confirm_issues=true when failed tasks are acknowledged and shutdown should still proceed.',
   'orphan-cleanup': 'Destructive escape hatch for known orphan recovery. Bypasses shutdown orchestration.',
   'read-events': 'Events are returned in canonical form; worker_idle log entries normalize to type worker_state_changed with source_type worker_idle. wakeable_only defaults to false; set wakeable_only=true to mirror omx team await semantics (wakeable events now include merge conflicts and per-signal stale alerts).',
   'await-event': 'Waits for the next matching event and returns status=timeout when no matching event arrives before timeout_ms. wakeable_only defaults to false; set wakeable_only=true to mirror omx team await semantics (wakeable events now include merge conflicts and per-signal stale alerts).',
@@ -1233,6 +1251,75 @@ async function ensureTeamModeState(
 
 }
 
+async function persistTeamShutdownModeState(
+  teamName: string,
+  cwd: string,
+  configSnapshot?: {
+    task: string;
+    workerCount: number;
+    agentType: string;
+  } | null,
+): Promise<void> {
+  const sessionStatePath = join(cwd, '.omx', 'state', 'session.json');
+  let scopedSessionId: string | undefined;
+  if (existsSync(sessionStatePath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(sessionStatePath, 'utf-8')) as { session_id?: unknown };
+      scopedSessionId = validateSessionId(parsed.session_id);
+    } catch {
+      // Best-effort shutdown state sync only.
+    }
+  }
+
+  const shutdownState: Record<string, unknown> = {
+    active: false,
+    current_phase: 'cancelled',
+    completed_at: new Date().toISOString(),
+    team_name: teamName,
+    ...(configSnapshot
+      ? {
+        task_description: configSnapshot.task,
+        agent_count: configSnapshot.workerCount,
+        agent_types: configSnapshot.agentType,
+      }
+      : {}),
+  };
+
+  const rootStatePath = getStatePath('team', cwd);
+  const hasRootState = existsSync(rootStatePath);
+  const hasScopedState = scopedSessionId
+    ? existsSync(getStatePath('team', cwd, scopedSessionId))
+    : false;
+
+  if (hasRootState || hasScopedState) {
+    if (hasRootState) {
+      persistExactTeamModeState(cwd, shutdownState);
+    }
+    if (scopedSessionId && hasScopedState) {
+      persistExactTeamModeState(cwd, shutdownState, scopedSessionId);
+    }
+    return;
+  }
+
+  const existing = await readModeState('team', cwd);
+  if (!existing) {
+    if (configSnapshot) {
+      await ensureTeamModeState({
+        task: configSnapshot.task,
+        workerCount: configSnapshot.workerCount,
+        agentType: configSnapshot.agentType,
+        explicitAgentType: false,
+        explicitWorkerCount: false,
+        teamName,
+      });
+    } else {
+      await startMode('team', `shutdown team ${teamName}`, 50, cwd);
+    }
+  }
+
+  await updateModeState('team', shutdownState, cwd);
+}
+
 
 async function renderStartSummary(runtime: TeamRuntime, staffingPlan?: FollowupStaffingPlan): Promise<void> {
   console.log(`Team started: ${runtime.teamName}`);
@@ -1525,14 +1612,22 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
 
   if (subcommand === 'shutdown') {
     const name = teamArgs[1];
-    if (!name) throw new Error('Usage: omx team shutdown <team-name> [--force]');
+    if (!name) throw new Error('Usage: omx team shutdown <team-name> [--force] [--confirm-issues]');
     const force = teamArgs.includes('--force');
-    const summary = await shutdownTeam(name, cwd, { force });
-    await updateModeState('team', {
-      active: false,
-      current_phase: 'cancelled',
-      completed_at: new Date().toISOString(),
-    }).catch((error: unknown) => {
+    const confirmIssues = teamArgs.includes('--confirm-issues');
+    const configBeforeShutdown = await readTeamConfig(name, cwd);
+    const summary = await shutdownTeam(name, cwd, { force, confirmIssues });
+    await persistTeamShutdownModeState(
+      name,
+      cwd,
+      configBeforeShutdown
+        ? {
+          task: configBeforeShutdown.task,
+          workerCount: configBeforeShutdown.worker_count,
+          agentType: configBeforeShutdown.agent_type,
+        }
+        : null,
+    ).catch((error: unknown) => {
       console.warn('[omx] warning: failed to persist team mode shutdown state', {
         team: name,
         error: error instanceof Error ? error.message : String(error),

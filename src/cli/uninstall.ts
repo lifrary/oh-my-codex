@@ -11,6 +11,10 @@ import {
   stripOmxTopLevelKeys,
   stripOmxFeatureFlags,
 } from "../config/generator.js";
+import {
+  parseCodexHooksConfig,
+  removeManagedCodexHooks,
+} from "../config/codex-hooks.js";
 import { getPackageRoot } from "../utils/package.js";
 import { AGENT_DEFINITIONS } from "../agents/definitions.js";
 import { detectLegacySkillRootOverlap } from "../utils/paths.js";
@@ -47,6 +51,7 @@ const OMX_MCP_SERVERS = [
   "omx_memory",
   "omx_code_intel",
   "omx_trace",
+  "omx_wiki",
 ];
 
 function detectOmxConfigArtifacts(config: string): {
@@ -294,12 +299,26 @@ async function removeHooksFile(
 ): Promise<boolean> {
   if (!existsSync(hooksFilePath)) return false;
 
+  const existing = await readFile(hooksFilePath, "utf-8");
+  const { nextContent, removedCount } = removeManagedCodexHooks(existing);
+  const parsed = parseCodexHooksConfig(existing);
+  const emptyManagedArtifact =
+    parsed !== null &&
+    Object.keys(parsed.hooks).length === 0 &&
+    Object.keys(parsed.root).every((key) => key === "hooks");
+
+  if (removedCount === 0 && !emptyManagedArtifact) return false;
+
   if (!options.dryRun) {
-    await rm(hooksFilePath, { force: true });
+    if (nextContent === null || emptyManagedArtifact) {
+      await rm(hooksFilePath, { force: true });
+    } else {
+      await writeFile(hooksFilePath, nextContent);
+    }
   }
   if (options.verbose) {
     console.log(
-      `  ${options.dryRun ? "Would remove" : "Removed"} ${basename(hooksFilePath)}`,
+      `  ${options.dryRun ? "Would clean" : nextContent === null || emptyManagedArtifact ? "Removed" : "Cleaned"} ${basename(hooksFilePath)}`,
     );
   }
   return true;
@@ -379,7 +398,7 @@ function printSummary(summary: UninstallSummary, dryRun: boolean): void {
   }
 
   if (summary.hooksFileRemoved) {
-    console.log(`  ${prefix} .codex/hooks.json`);
+    console.log(`  ${prefix} OMX-managed entries in .codex/hooks.json`);
   }
 
   if (summary.promptsRemoved > 0) {
@@ -479,7 +498,7 @@ export async function uninstall(options: UninstallOptions = {}): Promise<void> {
     verbose,
   });
   console.log(
-    `  ${dryRun ? "Would remove" : "Removed"} ${summary.hooksFileRemoved ? 1 : 0} hooks file(s).`,
+    `  ${dryRun ? "Would clean" : "Cleaned"} ${summary.hooksFileRemoved ? 1 : 0} hooks artifact(s).`,
   );
   console.log();
 

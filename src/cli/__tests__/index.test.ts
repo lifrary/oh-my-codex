@@ -1,9 +1,11 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, readdir as fsReaddir, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { once } from "node:events";
 import {
   normalizeCodexLaunchArgs,
   buildTmuxShellCommand,
@@ -13,6 +15,7 @@ import {
   resolveCliInvocation,
   commandOwnsLocalHelp,
   resolveCodexLaunchPolicy,
+  resolveLeaderLaunchPolicyOverride,
   classifyCodexExecFailure,
   resolveSignalExitCode,
   parseTmuxPaneSnapshot,
@@ -27,26 +30,35 @@ import {
   resolveSetupScopeArg,
   readPersistedSetupPreferences,
   readPersistedSetupScope,
+  resolveCodexConfigPathForLaunch,
   resolveCodexHomeForLaunch,
   buildDetachedSessionBootstrapSteps,
   buildDetachedTmuxSessionName,
   buildDetachedSessionFinalizeSteps,
   buildDetachedSessionRollbackSteps,
+  detectDetachedSessionWindowIndex,
   resolveNotifyTempContract,
   buildNotifyTempStartupMessages,
   buildNotifyFallbackWatcherEnv,
   shouldEnableNotifyFallbackWatcher,
   reapStaleNotifyFallbackWatcher,
   cleanupLaunchOrphanedMcpProcesses,
+  reapPostLaunchOrphanedMcpProcesses,
+  cleanupPostLaunchModeStateFiles,
   resolveBackgroundHelperLaunchMode,
   shouldDetachBackgroundHelper,
   resolveNotifyFallbackWatcherScript,
   resolveHookDerivedWatcherScript,
   resolveNotifyHookScript,
+  buildDetachedWindowsBootstrapScript,
   acquireTmuxExtendedKeysLease,
+  resolveNativeSessionName,
   releaseTmuxExtendedKeysLease,
   withTmuxExtendedKeys,
 } from "../index.js";
+import { ensureReusableNodeModules } from "../../utils/repo-deps.js";
+import { readAllState } from "../../hud/state.js";
+import { generateOverlay } from "../../hooks/agents-overlay.js";
 import { HUD_TMUX_HEIGHT_LINES } from "../../hud/constants.js";
 import {
   DEFAULT_FRONTIER_MODEL,
@@ -54,9 +66,16 @@ import {
 } from "../../config/models.js";
 import type { ProcessEntry } from "../cleanup.js";
 
+const testDir = dirname(fileURLToPath(import.meta.url));
+const repoRoot = join(testDir, "..", "..", "..");
+
 function expectedLowComplexityModel(codexHomeOverride?: string): string {
   return getTeamLowComplexityModel(codexHomeOverride);
 }
+
+afterEach(() => {
+  mock.restoreAll();
+});
 
 describe("normalizeCodexLaunchArgs", () => {
   it("maps --madmax to codex bypass flag", () => {
@@ -201,6 +220,43 @@ describe("normalizeCodexLaunchArgs", () => {
       "gpt-5",
     ]);
   });
+
+  it("strips --tmux from leader codex args", () => {
+    assert.deepEqual(normalizeCodexLaunchArgs(["--tmux", "--yolo"]), [
+      "--yolo",
+    ]);
+  });
+
+  it("preserves literal --tmux after -- in leader codex args", () => {
+    assert.deepEqual(normalizeCodexLaunchArgs(["--", "--tmux", "--yolo"]), [
+      "--",
+      "--tmux",
+      "--yolo",
+    ]);
+  });
+});
+
+describe("resolveLeaderLaunchPolicyOverride", () => {
+  it("detects explicit detached tmux launch requests", () => {
+    assert.equal(
+      resolveLeaderLaunchPolicyOverride(["--tmux", "--model", "gpt-5"]),
+      "detached-tmux",
+    );
+  });
+
+  it("returns undefined when no explicit policy override is present", () => {
+    assert.equal(
+      resolveLeaderLaunchPolicyOverride(["--model", "gpt-5"]),
+      undefined,
+    );
+  });
+
+  it("stops scanning for --tmux after the end-of-options marker", () => {
+    assert.equal(
+      resolveLeaderLaunchPolicyOverride(["--", "--tmux", "--model", "gpt-5"]),
+      undefined,
+    );
+  });
 });
 
 describe("resolveNotifyTempContract", () => {
@@ -321,6 +377,232 @@ describe("cleanupLaunchOrphanedMcpProcesses", () => {
       false,
       "launch-safe cleanup must preserve OMX MCP processes still attached to another live OMX launch tree",
     );
+  });
+});
+
+describe("reapPostLaunchOrphanedMcpProcesses", () => {
+  it("logs postLaunch reaped MCP orphans and keeps cleanup non-fatal", async () => {
+    const info: string[] = [];
+    const warnings: string[] = [];
+    const errors: string[] = [];
+
+    await reapPostLaunchOrphanedMcpProcesses({
+      cleanup: async () => ({
+        dryRun: false,
+        candidates: [],
+        terminatedCount: 2,
+        forceKilledCount: 0,
+        failedPids: [810],
+      }),
+      writeInfo: (line) => info.push(line),
+      writeWarn: (line) => warnings.push(line),
+      writeError: (line) => errors.push(line),
+    });
+
+    assert.deepEqual(errors, []);
+    assert.match(
+      info.join("\n"),
+      /postLaunch: reaped 2 orphaned OMX MCP process/,
+    );
+    assert.match(
+      warnings.join("\n"),
+      /postLaunch: failed to reap 1 orphaned OMX MCP process/,
+    );
+  });
+
+  it("writes a non-fatal postLaunch cleanup error when the cleanup step throws", async () => {
+    const errors: string[] = [];
+
+    await reapPostLaunchOrphanedMcpProcesses({
+      cleanup: async () => {
+        throw new Error("boom");
+      },
+      writeError: (line) => errors.push(line),
+    });
+
+    assert.match(errors.join("\n"), /postLaunch MCP cleanup failed: Error: boom/);
+  });
+});
+
+describe("cleanupPostLaunchModeStateFiles", () => {
+  it("repairs empty or truncated mode state files and still cancels valid siblings", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-postlaunch-mode-cleanup-"));
+    const sessionId = "sess-postlaunch-cleanup";
+    const stateDir = join(wd, ".omx", "state");
+    const sessionStateDir = join(stateDir, "sessions", sessionId);
+    const partialState = '{\n  "active": true,\n  "mode": "ralph",\n';
+    const warnings: string[] = [];
+
+    await mkdir(sessionStateDir, { recursive: true });
+    await writeFile(
+      join(stateDir, "autopilot-state.json"),
+      JSON.stringify({ active: true, mode: "autopilot" }, null, 2),
+      "utf-8",
+    );
+    await writeFile(join(stateDir, "deep-interview-state.json"), "", "utf-8");
+    await writeFile(join(sessionStateDir, "ralph-state.json"), partialState, "utf-8");
+
+    await cleanupPostLaunchModeStateFiles(wd, sessionId, {
+      writeWarn: (line) => warnings.push(line),
+    });
+
+    const autopilot = JSON.parse(
+      await readFile(join(stateDir, "autopilot-state.json"), "utf-8"),
+    ) as Record<string, unknown>;
+    const deepInterview = JSON.parse(
+      await readFile(join(stateDir, "deep-interview-state.json"), "utf-8"),
+    ) as Record<string, unknown>;
+    const ralph = JSON.parse(
+      await readFile(join(sessionStateDir, "ralph-state.json"), "utf-8"),
+    ) as Record<string, unknown>;
+    assert.equal(autopilot.active, false);
+    assert.equal(typeof autopilot.completed_at, "string");
+    assert.equal(deepInterview.active, false);
+    assert.equal(deepInterview.mode, "deep-interview");
+    assert.equal(deepInterview.current_phase, "cancelled");
+    assert.equal(typeof deepInterview.completed_at, "string");
+    assert.equal(typeof deepInterview.last_turn_at, "string");
+    assert.equal(ralph.active, false);
+    assert.equal(ralph.mode, "ralph");
+    assert.equal(ralph.current_phase, "cancelled");
+    assert.equal(typeof ralph.completed_at, "string");
+    assert.equal(typeof ralph.last_turn_at, "string");
+    const rootCanonicalPath = join(stateDir, "skill-active-state.json");
+    const sessionCanonicalPath = join(sessionStateDir, "skill-active-state.json");
+    if (existsSync(rootCanonicalPath)) {
+      const rootCanonical = JSON.parse(
+        await readFile(rootCanonicalPath, "utf-8"),
+      ) as Record<string, unknown>;
+      assert.equal(rootCanonical.active, false);
+      assert.deepEqual(rootCanonical.active_skills, []);
+    }
+    if (existsSync(sessionCanonicalPath)) {
+      const sessionCanonical = JSON.parse(
+        await readFile(sessionCanonicalPath, "utf-8"),
+      ) as Record<string, unknown>;
+      assert.equal(sessionCanonical.active, false);
+      assert.deepEqual(sessionCanonical.active_skills, []);
+    }
+    assert.deepEqual(warnings, []);
+  });
+
+  it("retries a transient parse failure before cancelling the rewritten mode state", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-postlaunch-mode-retry-"));
+    const sessionId = "sess-postlaunch-retry";
+    const stateDir = join(wd, ".omx", "state");
+    const statePath = join(stateDir, "ralph-state.json");
+    const writes: Array<{ path: string; content: string }> = [];
+    const validState = JSON.stringify({ active: true, mode: "ralph" }, null, 2);
+    let reads = 0;
+
+    await mkdir(stateDir, { recursive: true });
+
+    const mockReaddir = (async (dir: unknown, _options: unknown) => (
+      String(dir) === stateDir ? ["ralph-state.json"] : []
+    )) as unknown as typeof fsReaddir;
+    const mockReadFile = (async (path: unknown, _options: unknown) => {
+        assert.equal(String(path), statePath);
+        reads += 1;
+        return reads === 1
+          ? '{\n  "active": true,\n  "mode": "ralph"'
+          : validState;
+      }) as unknown as typeof readFile;
+    const mockWriteFile = (async (path: unknown, content: unknown, _options: unknown) => {
+        writes.push({ path: String(path), content: String(content) });
+      }) as unknown as typeof writeFile;
+
+    const dependencies: Parameters<typeof cleanupPostLaunchModeStateFiles>[2] = {
+      readdir: mockReaddir,
+      readFile: mockReadFile,
+      writeFile: mockWriteFile,
+      sleep: async () => {},
+      now: () => new Date("2026-04-07T00:00:00.000Z"),
+    };
+
+    await cleanupPostLaunchModeStateFiles(wd, sessionId, dependencies);
+
+    assert.equal(reads, 2);
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0]?.path, statePath);
+    const persisted = JSON.parse(writes[0]?.content ?? "{}") as Record<string, unknown>;
+    assert.equal(persisted.active, false);
+    assert.equal(persisted.completed_at, "2026-04-07T00:00:00.000Z");
+  });
+
+  it("warns on structurally complete malformed JSON without aborting sibling cleanup", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-postlaunch-mode-malformed-"));
+    const sessionId = "sess-postlaunch-malformed";
+    const stateDir = join(wd, ".omx", "state");
+    const warnings: string[] = [];
+    const malformedState = '{\n  "active": true,\n}\n';
+
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, "ralph-state.json"), malformedState, "utf-8");
+    await writeFile(
+      join(stateDir, "ultrawork-state.json"),
+      JSON.stringify({ active: true, mode: "ultrawork" }, null, 2),
+      "utf-8",
+    );
+
+    await cleanupPostLaunchModeStateFiles(wd, sessionId, {
+      writeWarn: (line) => warnings.push(line),
+    });
+
+    const ultrawork = JSON.parse(
+      await readFile(join(stateDir, "ultrawork-state.json"), "utf-8"),
+    ) as Record<string, unknown>;
+    assert.equal(ultrawork.active, false);
+    assert.equal(typeof ultrawork.completed_at, "string");
+    const canonicalPath = join(stateDir, "skill-active-state.json");
+    if (existsSync(canonicalPath)) {
+      const canonical = JSON.parse(
+        await readFile(canonicalPath, "utf-8"),
+      ) as Record<string, unknown>;
+      assert.equal(canonical.active, false);
+      assert.deepEqual(canonical.active_skills, []);
+    }
+    assert.equal(await readFile(join(stateDir, "ralph-state.json"), "utf-8"), malformedState);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0] ?? "", /skipped malformed mode state .*ralph-state\.json/);
+  });
+
+  it("clears canonical skill-active entries during cleanup and hides them from HUD/overlay readers", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-postlaunch-skill-active-cleanup-"));
+    const sessionId = "sess-skill-active-cleanup";
+    const stateDir = join(wd, ".omx", "state");
+    const sessionStateDir = join(stateDir, "sessions", sessionId);
+
+    await mkdir(sessionStateDir, { recursive: true });
+    await writeFile(join(stateDir, "session.json"), JSON.stringify({ session_id: sessionId }), "utf-8");
+    await writeFile(
+      join(sessionStateDir, "skill-active-state.json"),
+      JSON.stringify({
+        version: 1,
+        active: true,
+        skill: "autoresearch",
+        phase: "running",
+        session_id: sessionId,
+        active_skills: [
+          { skill: "autoresearch", phase: "running", active: true, session_id: sessionId },
+        ],
+      }, null, 2),
+      "utf-8",
+    );
+
+    await cleanupPostLaunchModeStateFiles(wd, sessionId);
+
+    const canonical = JSON.parse(
+      await readFile(join(sessionStateDir, "skill-active-state.json"), "utf-8"),
+    ) as Record<string, unknown>;
+    assert.equal(canonical.active, false);
+    assert.equal(canonical.phase, "complete");
+    assert.deepEqual(canonical.active_skills, []);
+
+    const hudState = await readAllState(wd);
+    assert.equal(hudState.autoresearch, null);
+
+    const overlay = await generateOverlay(wd, sessionId);
+    assert.equal(overlay.includes("- autoresearch:"), false);
   });
 });
 
@@ -594,6 +876,7 @@ describe("resolveTeamWorkerLaunchArgsEnv (spark)", () => {
 describe("commandOwnsLocalHelp", () => {
   it("returns true for nested commands that render their own help output", () => {
     for (const command of [
+      "adapt",
       "agents-init",
       "ask",
       "autoresearch",
@@ -824,6 +1107,23 @@ describe("project launch scope helpers", () => {
     }
   });
 
+  it("uses project config.toml for launch repair when persisted scope is project", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-launch-scope-"));
+    try {
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "setup-scope.json"),
+        JSON.stringify({ scope: "project" }),
+      );
+      assert.equal(
+        resolveCodexConfigPathForLaunch(wd, {}),
+        join(wd, ".codex", "config.toml"),
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it("keeps explicit CODEX_HOME override from env", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-launch-scope-"));
     try {
@@ -837,6 +1137,25 @@ describe("project launch scope helpers", () => {
           CODEX_HOME: "/tmp/explicit-codex-home",
         }),
         "/tmp/explicit-codex-home",
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("uses explicit CODEX_HOME config.toml for launch repair overrides", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-launch-scope-"));
+    try {
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "setup-scope.json"),
+        JSON.stringify({ scope: "project" }),
+      );
+      assert.equal(
+        resolveCodexConfigPathForLaunch(wd, {
+          CODEX_HOME: "/tmp/explicit-codex-home",
+        }),
+        "/tmp/explicit-codex-home/config.toml",
       );
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -923,6 +1242,21 @@ describe("resolveCodexLaunchPolicy", () => {
         false,
         true,
         true,
+      ),
+      "direct",
+    );
+  });
+
+  it("honors explicit detached tmux launch requests when tmux is available", () => {
+    assert.equal(
+      resolveCodexLaunchPolicy(
+        {},
+        "linux",
+        true,
+        false,
+        true,
+        true,
+        "detached-tmux",
       ),
       "detached-tmux",
     );
@@ -1103,7 +1437,7 @@ describe("detached tmux new-session sequencing", () => {
     const steps = buildDetachedSessionBootstrapSteps(
       "omx-demo",
       "/tmp/project",
-      "'codex' '--model' 'gpt-5'",
+      "'env' 'OMX_SESSION_ID=sess-detached-managed' 'codex' '--model' 'gpt-5'",
       "'node' '/tmp/omx.js' 'hud' '--watch'",
       null,
       undefined,
@@ -1117,6 +1451,14 @@ describe("detached tmux new-session sequencing", () => {
       newSession!.args.includes("-e") &&
         newSession!.args.some((arg) => arg === "OMX_SESSION_ID=sess-detached-managed"),
       true,
+    );
+  });
+
+  it("runCodex builds inside-tmux HUD command with OMX_SESSION_ID", async () => {
+    const source = await readFile(join(repoRoot, 'src', 'cli', 'index.ts'), 'utf-8');
+    assert.match(
+      source,
+      /buildTmuxPaneCommand\("env", \[`OMX_SESSION_ID=\$\{sessionId\}`, "node", omxBin, "hud", "--watch"\]\)/,
     );
   });
 
@@ -1142,7 +1484,19 @@ describe("detached tmux new-session sequencing", () => {
     assert.equal(steps[1]?.args.at(-1), hudCmd);
   });
 
-  it("buildDetachedSessionBootstrapSteps kills detached tmux session on exit and interrupt", () => {
+  it("buildDetachedWindowsBootstrapScript targets the resolved tmux-compatible command", () => {
+    const script = buildDetachedWindowsBootstrapScript(
+      "omx-demo",
+      "powershell.exe -NoLogo -NoExit -EncodedCommand abc",
+      2500,
+      "C:\\Program Files\\psmux\\psmux.exe",
+    );
+    assert.match(script, /const tmuxCommand = "C:\\\\Program Files\\\\psmux\\\\psmux\.exe";/);
+    assert.match(script, /execFileSync\(tmuxCommand, \['send-keys'/);
+    assert.doesNotMatch(script, /execFileSync\('tmux'/);
+  });
+
+  it("buildDetachedSessionBootstrapSteps kills detached tmux session on normal shell exit", () => {
     const steps = buildDetachedSessionBootstrapSteps(
       "omx-demo",
       "/tmp/project",
@@ -1152,17 +1506,22 @@ describe("detached tmux new-session sequencing", () => {
     );
     const leaderCmd = steps[0]?.args.at(-1);
     assert.equal(typeof leaderCmd, "string");
-    assert.match(leaderCmd!, /^\/bin\/sh -lc '/);
+    assert.match(leaderCmd!, /^\/bin\/sh -c '/);
+    assert.doesNotMatch(leaderCmd!, /^\/bin\/sh -lc '/);
     assert.match(leaderCmd!, /acquireTmuxExtendedKeysLease/);
     assert.match(leaderCmd!, /omx_detached_session_cleanup\(\)/);
-    assert.match(leaderCmd!, /trap omx_detached_session_cleanup 0 INT TERM HUP/);
+    assert.match(leaderCmd!, /trap omx_detached_session_cleanup 0 INT TERM HUP;/);
+    assert.match(leaderCmd!, /omx_codex_pid=\$!;/);
+    assert.match(leaderCmd!, /wait "\$omx_codex_pid";/);
+    assert.match(leaderCmd!, /kill -TERM "\$omx_codex_pid"/);
     assert.match(leaderCmd!, /releaseTmuxExtendedKeysLease/);
+    assert.match(leaderCmd!, /if \[ "\$status" -lt 128 \]; then/);
     assert.match(leaderCmd!, /tmux kill-session -t/);
     assert.match(leaderCmd!, /"omx-demo"/);
     assert.match(leaderCmd!, /exit \$status/);
   });
 
-  it("detached leader command executes codex and cleanup without shell-quote breakage", async () => {
+  it("detached leader command preserves cwd and cleanup without shell-quote breakage", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-detached-leader-"));
     const fakeBin = join(cwd, "bin");
     const logPath = join(cwd, "leader.log");
@@ -1173,7 +1532,87 @@ describe("detached tmux new-session sequencing", () => {
         join(fakeBin, "codex"),
         `#!/bin/sh
 printf 'codex:%s\\n' "$*" >> "${logPath}"
+printf 'codex-pwd:%s\\n' "$(pwd)" >> "${logPath}"
 exit 0
+`,
+      );
+      await chmod(join(fakeBin, "codex"), 0o755);
+      await writeFile(join(cwd, ".profile"), "cd ..\n");
+      await writeFile(
+        join(fakeBin, "tmux"),
+        `#!/bin/sh
+printf 'tmux:%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  display-message)
+    if [ "$3" = '#{socket_path}' ] || [ "$4" = '#{socket_path}' ]; then
+      printf '/tmp/tmux-test.sock\\n'
+    else
+      printf '0\\n'
+    fi
+    ;;
+  show-options)
+    printf 'off\\n'
+    ;;
+  set-option|kill-session)
+    ;;
+esac
+exit 0
+`,
+      );
+      await chmod(join(fakeBin, "tmux"), 0o755);
+
+      const steps = buildDetachedSessionBootstrapSteps(
+        "omx-demo",
+        cwd,
+        buildTmuxPaneCommand(
+          "codex",
+          ["--dangerously-bypass-approvals-and-sandbox"],
+          "/bin/sh",
+        ),
+        "'node' '/tmp/omx.js' 'hud' '--watch'",
+        null,
+      );
+      const leaderCmd = steps[0]?.args.at(-1);
+      assert.equal(typeof leaderCmd, "string");
+
+      (await import("node:child_process")).execFileSync("/bin/sh", ["-c", leaderCmd!], {
+        cwd,
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+          HOME: cwd,
+        },
+        stdio: "ignore",
+      });
+
+      const log = await readFile(logPath, "utf-8");
+      assert.match(log, /codex:--dangerously-bypass-approvals-and-sandbox/);
+      assert.match(
+        log,
+        new RegExp(`codex-pwd:${cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+      );
+      assert.match(log, /tmux:display-message -p #\{socket_path\}/);
+      assert.match(log, /tmux:show-options -sv extended-keys/);
+      assert.match(log, /tmux:set-option -sq extended-keys always/);
+      assert.match(log, /tmux:set-option -sq extended-keys off/);
+      assert.match(log, /tmux:kill-session -t omx-demo/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("detached leader command preserves the detached tmux session on signal-derived exits", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-detached-leader-signal-"));
+    const fakeBin = join(cwd, "bin");
+    const logPath = join(cwd, "leader.log");
+
+    try {
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(
+        join(fakeBin, "codex"),
+        `#!/bin/sh
+printf 'codex:%s\\n' "$*" >> "${logPath}"
+exit 143
 `,
       );
       await chmod(join(fakeBin, "codex"), 0o755);
@@ -1214,7 +1653,75 @@ exit 0
       const leaderCmd = steps[0]?.args.at(-1);
       assert.equal(typeof leaderCmd, "string");
 
-      execFileSync("/bin/sh", ["-lc", leaderCmd!], {
+      const result = (await import("node:child_process")).spawnSync("/bin/sh", ["-lc", leaderCmd!], {
+        cwd,
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+          HOME: cwd,
+        },
+        encoding: "utf-8",
+      });
+
+      assert.equal(result.status, 143);
+      const log = await readFile(logPath, "utf-8");
+      assert.match(log, /codex:--dangerously-bypass-approvals-and-sandbox/);
+      assert.match(log, /tmux:display-message -p #\{socket_path\}/);
+      assert.match(log, /tmux:show-options -sv extended-keys/);
+      assert.match(log, /tmux:set-option -sq extended-keys always/);
+      assert.match(log, /tmux:set-option -sq extended-keys off/);
+      assert.doesNotMatch(log, /tmux:kill-session -t omx-demo/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("detached leader command terminates codex child on external SIGHUP", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-detached-leader-hup-"));
+    const fakeBin = join(cwd, "bin");
+    const pidFile = join(cwd, "codex.pid");
+    try {
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(
+        join(fakeBin, "codex"),
+        `#!/bin/sh
+echo $$ > "${pidFile}"
+trap '' HUP
+while true; do sleep 1; done
+`,
+      );
+      await chmod(join(fakeBin, "codex"), 0o755);
+      await writeFile(
+        join(fakeBin, "tmux"),
+        `#!/bin/sh
+case "$1" in
+  display-message)
+    if [ "$3" = '#{socket_path}' ] || [ "$4" = '#{socket_path}' ]; then
+      printf '/tmp/tmux-test.sock\\n'
+    else
+      printf '0\\n'
+    fi
+    ;;
+  show-options) printf 'off\\n' ;;
+  set-option|kill-session) ;;
+esac
+exit 0
+`,
+      );
+      await chmod(join(fakeBin, "tmux"), 0o755);
+
+      const steps = buildDetachedSessionBootstrapSteps(
+        "omx-demo",
+        cwd,
+        buildTmuxPaneCommand("codex", [], "/bin/sh"),
+        "'node' '/tmp/omx.js' 'hud' '--watch'",
+        null,
+      );
+      const leaderCmd = steps[0]?.args.at(-1);
+      assert.equal(typeof leaderCmd, "string");
+
+      const { spawn } = await import("node:child_process");
+      const child = spawn("/bin/sh", ["-c", `exec ${leaderCmd!}`], {
         cwd,
         env: {
           ...process.env,
@@ -1222,15 +1729,43 @@ exit 0
           HOME: cwd,
         },
         stdio: "ignore",
+        detached: true,
       });
 
-      const log = await readFile(logPath, "utf-8");
-      assert.match(log, /codex:--dangerously-bypass-approvals-and-sandbox/);
-      assert.match(log, /tmux:display-message -p #\{socket_path\}/);
-      assert.match(log, /tmux:show-options -sv extended-keys/);
-      assert.match(log, /tmux:set-option -sq extended-keys always/);
-      assert.match(log, /tmux:set-option -sq extended-keys off/);
-      assert.match(log, /tmux:kill-session -t omx-demo/);
+      try {
+        for (let i = 0; i < 20; i += 1) {
+          if (existsSync(pidFile)) break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        assert.ok(existsSync(pidFile), "codex pid file not written");
+        const codexPid = Number.parseInt((await readFile(pidFile, "utf-8")).trim(), 10);
+        assert.ok(codexPid > 0, "codex pid must be positive");
+        assert.doesNotThrow(() => process.kill(codexPid, 0), "codex must be alive before signal");
+
+        const leaderExit = once(child, "exit");
+        process.kill(child.pid!, "SIGHUP");
+        await Promise.race([
+          leaderExit,
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("leader did not exit after SIGHUP")), 3000),
+          ),
+        ]);
+        assert.throws(
+          () => process.kill(codexPid, 0),
+          (err: unknown) =>
+            typeof err === "object" &&
+            err !== null &&
+            "code" in err &&
+            (err as NodeJS.ErrnoException).code === "ESRCH",
+          "codex child must be terminated after leader SIGHUP",
+        );
+      } finally {
+        try {
+          process.kill(child.pid!, "SIGKILL");
+        } catch {
+          /* already dead */
+        }
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1396,7 +1931,26 @@ exit 0
     );
     assert.deepEqual(
       steps.map((step) => step.name),
-      ["set-mouse", "attach-session"],
+      ["set-mouse", "sanitize-copy-mode-style", "attach-session"],
+    );
+  });
+
+  it("buildDetachedSessionFinalizeSteps sanitizes copy-mode styling before attach when mouse mode is enabled", () => {
+    const steps = buildDetachedSessionFinalizeSteps(
+      "omx-demo",
+      "%12",
+      "3",
+      true,
+    );
+    assert.equal(
+      steps.findIndex((step) => step.name === "sanitize-copy-mode-style")
+      > steps.findIndex((step) => step.name === "set-mouse"),
+      true,
+    );
+    assert.equal(
+      steps.findIndex((step) => step.name === "attach-session")
+      > steps.findIndex((step) => step.name === "sanitize-copy-mode-style"),
+      true,
     );
   });
 
@@ -1469,46 +2023,67 @@ describe("buildTmuxShellCommand", () => {
 });
 
 describe("buildTmuxPaneCommand", () => {
-  it("wraps command with zsh profile sourcing for zsh shell", () => {
+  it("wraps command with zsh profile sourcing while preserving tmux cwd", () => {
     const result = buildTmuxPaneCommand(
       "codex",
       ["--model", "gpt-5"],
       "/usr/bin/zsh",
     );
     assert.ok(
-      result.startsWith("'/usr/bin/zsh' -lc "),
-      "should start with zsh login shell",
+      result.startsWith("'/usr/bin/zsh' -c "),
+      "should start with zsh non-login shell to preserve tmux cwd",
     );
+    assert.ok(!result.includes(" -lc "), "should not use a login shell");
     assert.ok(result.includes("source ~/.zshrc"), "should source .zshrc");
     assert.ok(result.includes("exec "), "should exec the command");
   });
 
-  it("wraps command with bash profile sourcing for bash shell", () => {
+  it("keeps Homebrew zsh instead of downgrading to /bin/sh", () => {
+    const result = buildTmuxPaneCommand(
+      "codex",
+      ["--model", "gpt-5"],
+      "/opt/homebrew/bin/zsh",
+    );
+    assert.ok(
+      result.startsWith("'/opt/homebrew/bin/zsh' -c "),
+      "should preserve Homebrew zsh when SHELL points to it",
+    );
+    assert.ok(
+      !result.startsWith("'/bin/sh' -c "),
+      "should not fall back to /bin/sh for supported Homebrew zsh",
+    );
+    assert.ok(result.includes("source ~/.zshrc"), "should source .zshrc");
+  });
+
+  it("wraps command with bash profile sourcing while preserving tmux cwd", () => {
     const result = buildTmuxPaneCommand("codex", [], "/bin/bash");
     assert.ok(
-      result.startsWith("'/bin/bash' -lc "),
-      "should start with bash login shell",
+      result.startsWith("'/bin/bash' -c "),
+      "should start with bash non-login shell to preserve tmux cwd",
     );
+    assert.ok(!result.includes(" -lc "), "should not use a login shell");
     assert.ok(result.includes("source ~/.bashrc"), "should source .bashrc");
     assert.ok(result.includes("exec "), "should exec the command");
   });
 
-  it("skips rc sourcing for unknown shells but still uses login flag", () => {
+  it("skips rc sourcing for unknown shells without using a login shell", () => {
     const result = buildTmuxPaneCommand("codex", [], "/bin/fish");
     assert.ok(
-      result.startsWith("'/bin/fish' -lc "),
-      "should start with fish login shell",
+      result.startsWith("'/bin/fish' -c "),
+      "should start with fish non-login shell",
     );
+    assert.ok(!result.includes(" -lc "), "should not use a login shell");
     assert.ok(!result.includes("source"), "should not source any rc file");
     assert.ok(result.includes("exec "), "should exec the command");
   });
 
-  it("falls back to /bin/sh when shell path is empty", () => {
+  it("falls back to /bin/sh without using a login shell when shell path is empty", () => {
     const result = buildTmuxPaneCommand("codex", [], "");
     assert.ok(
-      result.startsWith("'/bin/sh' -lc "),
+      result.startsWith("'/bin/sh' -c "),
       "should fall back to /bin/sh",
     );
+    assert.ok(!result.includes(" -lc "), "should not use a login shell");
   });
 });
 
@@ -1582,6 +2157,89 @@ describe("buildDetachedTmuxSessionName", () => {
       "omx-1770992424158-abc123",
     );
     assert.equal(sessionName, "omx-my-repo-detached-1770992424158-abc123");
+  });
+});
+
+describe("native Windows psmux-compatible tmux resolution", () => {
+  it("resolveNativeSessionName uses the shared tmux-aware resolver for current session lookup", async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    const originalPath = process.env.PATH;
+    const originalPathext = process.env.PATHEXT;
+    const wd = await mkdtemp(join(tmpdir(), "omx-psmux-native-session-"));
+    const fakeBin = join(wd, "bin");
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+
+    try {
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(
+        join(fakeBin, "psmux.exe"),
+        `#!/bin/sh
+if [ "$1" = "display-message" ] && [ "$2" = "-p" ] && [ "$3" = "-t" ] && [ "$4" = "%7" ] && [ "$5" = "#S" ]; then
+  printf 'psmux-session\\n'
+  exit 0
+fi
+printf 'unexpected:%s\\n' "$*" >&2
+exit 1
+`,
+      );
+      await chmod(join(fakeBin, "psmux.exe"), 0o755);
+      process.env.PATH = fakeBin;
+      process.env.PATHEXT = ".EXE";
+      const sessionName = resolveNativeSessionName("/tmp/repo", "omx-abc123", {
+        ...process.env,
+        TMUX: "1",
+        TMUX_PANE: "%7",
+      });
+      assert.equal(sessionName, "psmux-session");
+    } finally {
+      process.env.PATH = originalPath;
+      process.env.PATHEXT = originalPathext;
+      if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("detectDetachedSessionWindowIndex uses the shared tmux-aware resolver on native Windows", async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    const originalPath = process.env.PATH;
+    const originalPathext = process.env.PATHEXT;
+    const wd = await mkdtemp(join(tmpdir(), "omx-psmux-window-index-"));
+    const fakeBin = join(wd, "bin");
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+
+    try {
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(
+        join(fakeBin, "psmux.exe"),
+        `#!/bin/sh
+if [ "$1" = "display-message" ] && [ "$2" = "-p" ] && [ "$3" = "-t" ] && [ "$4" = "omx-demo" ] && [ "$5" = "#{window_index}" ]; then
+  printf '3\\n'
+  exit 0
+fi
+printf 'unexpected:%s\\n' "$*" >&2
+exit 1
+`,
+      );
+      await chmod(join(fakeBin, "psmux.exe"), 0o755);
+      process.env.PATH = fakeBin;
+      process.env.PATHEXT = ".EXE";
+      assert.equal(detectDetachedSessionWindowIndex("omx-demo"), "3");
+    } finally {
+      process.env.PATH = originalPath;
+      process.env.PATHEXT = originalPathext;
+      if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("worktree dependency bootstrap helpers", () => {
+  it("returns an explicit warning when reusable worktree dependencies are unavailable", () => {
+    const result = ensureReusableNodeModules("/tmp/non-worktree", {
+      gitRunner: () => ({ status: 1, stdout: "", stderr: "not a worktree" }) as any,
+    });
+    assert.equal(result.strategy, "missing");
+    assert.match(String(result.warning || ""), /No reusable parent-repo node_modules was found/);
   });
 });
 

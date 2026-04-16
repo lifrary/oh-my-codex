@@ -17,6 +17,12 @@
 
 OMX is a workflow layer for [OpenAI Codex CLI](https://github.com/openai/codex).
 
+<table>
+<tr>
+<td><strong>🚨 CAUTION — RECOMMENDED DEFAULT ONLY: macOS or Linux with Codex CLI.</strong><br><br><strong>OMX is primarily designed and actively tuned for that path.</strong><br><strong>Native Windows and Codex App are not the default experience, may break or behave inconsistently, and currently receive less support.</strong></td>
+</tr>
+</table>
+
 It keeps Codex as the execution engine and makes it easier to:
 - start a stronger Codex session by default
 - run one consistent workflow from clarification to completion
@@ -85,8 +91,8 @@ If you want plain Codex with no extra workflow layer, you probably do not need O
 - Node.js 20+
 - Codex CLI installed: `npm install -g @openai/codex`
 - Codex auth configured
-- `tmux` on macOS/Linux if you later want the durable team runtime
-- `psmux` on native Windows if you later want Windows team mode
+- `tmux` on macOS/Linux if you want the recommended durable team runtime
+- `psmux` on native Windows only if you intentionally want the less-supported Windows team path
 
 ### A good first session
 
@@ -94,6 +100,13 @@ Launch OMX the recommended way:
 
 ```bash
 omx --madmax --high
+```
+
+This starts the interactive leader session directly by default.
+If you explicitly want the leader session in tmux, use:
+
+```bash
+omx --tmux --madmax --high
 ```
 
 Then try the canonical workflow:
@@ -162,6 +175,8 @@ omx team shutdown <team-name>
 
 These are operator/support surfaces:
 - `omx setup` installs prompts, skills, AGENTS scaffolding, `.codex/config.toml`, and OMX-managed native Codex hooks in `.codex/hooks.json`
+  - setup refresh preserves non-OMX hook entries in `.codex/hooks.json` and only rewrites OMX-managed wrappers
+  - `omx uninstall` removes OMX-managed wrappers from `.codex/hooks.json` but keeps the file when user hooks remain
 - `omx doctor` verifies the install when something seems wrong
 - `omx hud --watch` is a monitoring/status surface, not the primary user workflow
 
@@ -176,6 +191,7 @@ See [Codex native hook mapping](./docs/codex-native-hooks.md) for the current na
 
 - `omx explore --prompt "..."` is for read-only repository lookup
 - `omx sparkshell <command>` is for shell-native inspection and bounded verification
+- when `.omx/wiki/` exists, `omx explore` can inject wiki-first context before falling back to broader repository search
 
 Examples:
 
@@ -185,9 +201,26 @@ omx sparkshell git status
 omx sparkshell --tmux-pane %12 --tail-lines 400
 ```
 
+### Wiki
+
+- `omx wiki` is the CLI parity surface for the OMX wiki MCP server
+- wiki data lives locally under `.omx/wiki/`
+- the wiki is markdown-first and search-first, not vector-first
+
+Examples:
+
+```bash
+omx wiki list --json
+omx wiki query --input '{"query":"session-start lifecycle"}' --json
+omx wiki lint --json
+omx wiki refresh --json
+```
+
 ### Platform notes for team mode
 
-`omx team` needs a tmux-compatible backend:
+`omx team` works best on macOS/Linux with `tmux`.
+Native Windows remains a secondary path, and WSL2 is generally the better choice if you want a Windows-hosted setup.
+On native Windows, OMX accepts `psmux` as the tmux-compatible binary for the existing tmux-backed paths it already uses.
 
 | Platform | Install |
 | --- | --- |
@@ -213,6 +246,7 @@ If this happens, try:
 
 - [Getting Started](./docs/getting-started.html)
 - [Demo guide](./DEMO.md)
+- [Wiki feature](./docs/wiki-feature.md)
 - [Agent catalog](./docs/agents.html)
 - [Skills reference](./docs/skills.html)
 - [Codex native hook mapping](./docs/codex-native-hooks.md)

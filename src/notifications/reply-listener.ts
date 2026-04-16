@@ -30,8 +30,14 @@ import {
   removeMessagesByPane,
   pruneStale,
 } from './session-registry.js';
+import {
+  NO_TRACKED_SESSION_MESSAGE,
+  buildDiscordSessionStatusReply,
+  isDiscordStatusCommand,
+} from './session-status.js';
 import { parseMentionAllowedMentions } from './config.js';
 import { parseTmuxTail } from './formatter.js';
+import { spawnPlatformCommandSync } from '../utils/platform-command.js';
 import type { ReplyConfig } from './types.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -270,19 +276,36 @@ const DAEMON_IDENTITY_MARKER = 'pollLoop';
  * inspecting its command line for the daemon identity marker. Returns false if
  * the process cannot be positively identified (safe default).
  */
-export function isReplyListenerProcess(pid: number): boolean {
+export function isReplyListenerProcess(
+  pid: number,
+  options: {
+    platform?: NodeJS.Platform;
+    env?: NodeJS.ProcessEnv;
+    existsImpl?: typeof existsSync;
+    spawnImpl?: typeof spawnSync;
+  } = {},
+): boolean {
   try {
-    if (process.platform === 'linux') {
+    const platform = options.platform ?? process.platform;
+    if (platform === 'linux') {
       // NUL-separated argv available without spawning a subprocess
       const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf-8');
       return cmdline.includes(DAEMON_IDENTITY_MARKER);
     }
     if (process.platform === 'win32') return false;
     // macOS and other POSIX systems
-    const result = spawnSync('ps', ['-p', String(pid), '-o', 'args='], {
-      encoding: 'utf-8',
-      timeout: 3000,
-    });
+    const { result } = spawnPlatformCommandSync(
+      'ps',
+      ['-p', String(pid), '-o', 'args='],
+      {
+        encoding: 'utf-8',
+        timeout: 3000,
+      },
+      platform,
+      options.env,
+      options.existsImpl,
+      options.spawnImpl,
+    );
     if (result.status !== 0 || result.error) return false;
     return (result.stdout ?? '').includes(DAEMON_IDENTITY_MARKER);
   } catch {
@@ -385,6 +408,7 @@ export interface ReplyListenerPollDeps {
   fetchImpl?: typeof fetch;
   httpsRequestImpl?: typeof httpsRequest;
   injectReplyImpl?: typeof injectReply;
+  buildSessionStatusReplyImpl?: typeof buildDiscordSessionStatusReply;
   captureReplyAcknowledgementSummaryImpl?: typeof captureReplyAcknowledgementSummary;
   lookupByMessageIdImpl?: typeof lookupByMessageId;
   writeDaemonStateImpl?: typeof writeDaemonState;
@@ -449,6 +473,41 @@ function injectReply(
   return success;
 }
 
+async function postDiscordReplyMessage(
+  config: ReplyListenerDaemonConfig,
+  replyToMessageId: string,
+  content: string,
+  deps: {
+    fetchImpl: typeof fetch;
+    logImpl: typeof log;
+  },
+): Promise<void> {
+  try {
+    const response = await deps.fetchImpl(
+      `https://discord.com/api/v10/channels/${config.discordChannelId}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bot ${config.discordBotToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          content,
+          message_reference: { message_id: replyToMessageId },
+          allowed_mentions: { parse: [] as string[] },
+        }),
+        signal: AbortSignal.timeout(5000),
+      },
+    );
+
+    if (!response.ok) {
+      deps.logImpl(`WARN: Failed to send Discord reply message: HTTP ${response.status}`);
+    }
+  } catch (error) {
+    deps.logImpl(`WARN: Failed to send Discord reply message: ${error}`);
+  }
+}
+
 // ============================================================================
 // Discord Polling
 // ============================================================================
@@ -480,6 +539,7 @@ export async function pollDiscordOnce(
 
   const fetchImpl = deps.fetchImpl ?? fetch;
   const injectReplyImpl = deps.injectReplyImpl ?? injectReply;
+  const buildSessionStatusReplyImpl = deps.buildSessionStatusReplyImpl ?? buildDiscordSessionStatusReply;
   const captureReplyAcknowledgementSummaryImpl = deps.captureReplyAcknowledgementSummaryImpl ?? captureReplyAcknowledgementSummary;
   const lookupByMessageIdImpl = deps.lookupByMessageIdImpl ?? lookupByMessageId;
   const writeDaemonStateImpl = deps.writeDaemonStateImpl ?? writeDaemonState;
@@ -522,6 +582,8 @@ export async function pollDiscordOnce(
     const sorted = [...messages].reverse();
 
     for (const msg of sorted) {
+      const isStatusCommand = isDiscordStatusCommand(msg.content ?? '');
+
       if (!msg.message_reference?.message_id) {
         state.discordLastMessageId = msg.id;
         writeDaemonStateImpl(state);
@@ -535,22 +597,33 @@ export async function pollDiscordOnce(
       }
 
       const mapping = lookupByMessageIdImpl('discord-bot', msg.message_reference.message_id);
+      state.discordLastMessageId = msg.id;
+      writeDaemonStateImpl(state);
+
       if (!mapping) {
-        state.discordLastMessageId = msg.id;
-        writeDaemonStateImpl(state);
+        if (isStatusCommand) {
+          await postDiscordReplyMessage(config, msg.id, NO_TRACKED_SESSION_MESSAGE, {
+            fetchImpl,
+            logImpl,
+          });
+        }
         continue;
       }
 
       if (!rateLimiter.canProceed()) {
         logImpl(`WARN: Rate limit exceeded, dropping Discord message ${msg.id}`);
-        state.discordLastMessageId = msg.id;
-        writeDaemonStateImpl(state);
         state.errors++;
         continue;
       }
 
-      state.discordLastMessageId = msg.id;
-      writeDaemonStateImpl(state);
+      if (isStatusCommand) {
+        const statusMessage = await buildSessionStatusReplyImpl(mapping);
+        await postDiscordReplyMessage(config, msg.id, statusMessage, {
+          fetchImpl,
+          logImpl,
+        });
+        continue;
+      }
 
       const success = injectReplyImpl(mapping.tmuxPaneId, msg.content, 'discord', config);
       if (success) {
